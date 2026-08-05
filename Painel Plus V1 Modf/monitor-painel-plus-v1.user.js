@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Painel Plus V1 Modf
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
-// @description  Pendências agrupadas por unidade, contador rápido, detalhes da tabela e reconciliação automática.
+// @version      1.2.0
+// @description  Dupla checagem pelo contador X encomenda(s) e pela tabela detalhada, com reconciliação automática.
 // @author       Daniel Alexandre
 // @match        https://app.econdos.com.br/*
 // @run-at       document-idle
@@ -14,23 +14,23 @@
 
     const STORAGE = "painel_plus_v1_modf_pendencias";
     const INTERVALO = 800;
-    const LIMITE_SUSPEITO = 50;
+    const ZERO_CONFIRMACOES = 2;
 
     let apartamentoAtual = "";
-    let quantidadeAtual = null;
-    let encomendasAtuais = [];
+    let contadorAtual = null;
+    let linhasAtuais = [];
     let ultimaURL = location.href;
     let saidaProcessada = false;
-    let zeroApartamento = "";
-    let zeroConfirmacoes = 0;
+    let zeroApto = "";
+    let zerosSeguidos = 0;
 
-    function normalizar(v) {
-        return String(v || "").trim().toLowerCase()
+    function normalizar(valor) {
+        return String(valor || "").trim().toLowerCase()
             .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
     }
 
-    function escapar(v) {
-        return String(v ?? "")
+    function escapar(valor) {
+        return String(valor ?? "")
             .replaceAll("&", "&amp;")
             .replaceAll("<", "&lt;")
             .replaceAll(">", "&gt;")
@@ -62,11 +62,11 @@
     }
 
     function lerContador() {
-        for (const el of document.querySelectorAll("small, span")) {
-            if (el.offsetParent === null) continue;
-            const texto = normalizar(el.textContent);
-            const m = texto.match(/(?:^|\s)(\d+)\s+encomenda(?:\(s\)|s)?(?:\s|$)/);
-            if (m) return Number(m[1]);
+        for (const elemento of document.querySelectorAll("small, span")) {
+            if (elemento.offsetParent === null) continue;
+            const texto = normalizar(elemento.textContent);
+            const achou = texto.match(/(?:^|\s)(\d+)\s+encomenda(?:\(s\)|s)?(?:\s|$)/);
+            if (achou) return Number(achou[1]);
         }
         return null;
     }
@@ -112,30 +112,19 @@
         return resultado;
     }
 
-    function pendenciaExiste(apartamento) {
-        return carregar().some(item => item.apartamento === apartamento);
+    function chave(item) {
+        return [
+            item.numero,
+            item.apartamento,
+            item.destinatario,
+            item.status,
+            item.data,
+            item.resumo
+        ].join("|");
     }
 
-    function criarOuAtualizar(apartamento, quantidade, encomendas, motivo) {
-        if (!apartamento || quantidade <= 0) return;
-
-        const lista = carregar();
-        const indice = lista.findIndex(item => item.apartamento === apartamento);
-        const anterior = indice >= 0 ? lista[indice] : null;
-
-        const registro = {
-            apartamento,
-            quantidade,
-            encomendas: encomendas.length ? encomendas : (anterior?.encomendas || []),
-            motivo,
-            atualizadoEm: new Date().toLocaleString("pt-BR"),
-            timestamp: Date.now()
-        };
-
-        if (indice >= 0) lista[indice] = registro;
-        else lista.unshift(registro);
-
-        gravar(lista);
+    function registroDo(apartamento) {
+        return carregar().find(item => item.apartamento === apartamento) || null;
     }
 
     function remover(apartamento) {
@@ -144,44 +133,166 @@
         if (nova.length !== lista.length) gravar(nova);
     }
 
-    function confirmarZero(apartamento, contador, linhas) {
-        if (contador !== 0 || linhas.length !== 0) {
-            zeroApartamento = "";
-            zeroConfirmacoes = 0;
+    function salvarRegistro(registro) {
+        const lista = carregar();
+        const indice = lista.findIndex(item => item.apartamento === registro.apartamento);
+
+        registro.atualizadoEm = new Date().toLocaleString("pt-BR");
+        registro.timestamp = Date.now();
+
+        if (indice >= 0) lista[indice] = registro;
+        else lista.unshift(registro);
+
+        gravar(lista);
+    }
+
+    function criarPendenciaNormal(apartamento, contador, linhas, motivo) {
+        if (!apartamento || contador === null || contador <= 0) return;
+
+        const anterior = registroDo(apartamento);
+        const detalhes = linhas.length ? linhas : (anterior?.itensOriginais || []);
+
+        salvarRegistro({
+            apartamento,
+            status: "PENDENTE",
+            quantidade: contador,
+            contadorCheck: contador,
+            tabelaCheck: linhas.length,
+            itensOriginais: detalhes,
+            motivo,
+            mensagem: `${contador} encomenda(s) sem baixa`
+        });
+    }
+
+    function criarAguardandoConfirmacao(apartamento, linhas, motivo) {
+        const anterior = registroDo(apartamento);
+        const detalhes = linhas.length ? linhas : (anterior?.itensOriginais || []);
+
+        salvarRegistro({
+            apartamento,
+            status: "AGUARDANDO_CONFIRMACAO",
+            quantidade: 0,
+            contadorCheck: 0,
+            tabelaCheck: linhas.length,
+            itensOriginais: detalhes,
+            motivo,
+            mensagem: linhas.length
+                ? "Baixa identificada no contador; tabela ainda não confirmou"
+                : "Baixa identificada; aguardando conferência final"
+        });
+    }
+
+    function resetarZero() {
+        zeroApto = "";
+        zerosSeguidos = 0;
+    }
+
+    function confirmarZeroContador(apartamento, contador) {
+        if (contador !== 0) {
+            resetarZero();
             return false;
         }
 
-        if (zeroApartamento !== apartamento) {
-            zeroApartamento = apartamento;
-            zeroConfirmacoes = 1;
+        if (zeroApto !== apartamento) {
+            zeroApto = apartamento;
+            zerosSeguidos = 1;
             return false;
         }
 
-        zeroConfirmacoes++;
-        return zeroConfirmacoes >= 2;
+        zerosSeguidos++;
+        return zerosSeguidos >= ZERO_CONFIRMACOES;
+    }
+
+    function reconciliarRegistro(apartamento, contador, linhas) {
+        const registro = registroDo(apartamento);
+        if (!registro) return;
+
+        if (contador === 0 && confirmarZeroContador(apartamento, contador)) {
+            remover(apartamento);
+            return;
+        }
+
+        if (contador === null) return;
+        if (contador > 0) resetarZero();
+
+        const chavesAtuais = new Set(linhas.map(chave));
+        const originais = registro.itensOriginais || [];
+        const antigasAindaPresentes = originais.filter(item => chavesAtuais.has(chave(item)));
+
+        if (originais.length && linhas.length && antigasAindaPresentes.length === 0) {
+            remover(apartamento);
+            return;
+        }
+
+        if (registro.status === "AGUARDANDO_CONFIRMACAO") {
+            if (contador === 0) return;
+
+            if (originais.length && antigasAindaPresentes.length > 0) {
+                salvarRegistro({
+                    ...registro,
+                    status: "PENDENTE",
+                    quantidade: Math.min(contador, antigasAindaPresentes.length),
+                    contadorCheck: contador,
+                    tabelaCheck: linhas.length,
+                    itensOriginais: antigasAindaPresentes,
+                    mensagem: `${Math.min(contador, antigasAindaPresentes.length)} encomenda(s) antiga(s) ainda pendente(s)`,
+                    motivo: "Reconciliação após reabrir a unidade"
+                });
+            }
+            return;
+        }
+
+        if (originais.length && antigasAindaPresentes.length < originais.length) {
+            if (!antigasAindaPresentes.length) {
+                remover(apartamento);
+                return;
+            }
+
+            salvarRegistro({
+                ...registro,
+                quantidade: antigasAindaPresentes.length,
+                contadorCheck: contador,
+                tabelaCheck: linhas.length,
+                itensOriginais: antigasAindaPresentes,
+                mensagem: `${antigasAindaPresentes.length} encomenda(s) antiga(s) ainda pendente(s)`,
+                motivo: "Pendência atualizada pela tabela detalhada"
+            });
+        }
     }
 
     function registrarSaida(motivo) {
-        if (saidaProcessada) return;
-        if (!apartamentoAtual) return;
-        if (quantidadeAtual === null || quantidadeAtual <= 0) return;
+        if (saidaProcessada || !apartamentoAtual) return;
+
+        const contadorSaida = lerContador();
+        const linhasSaida = capturarLinhas(apartamentoAtual);
+
+        if (contadorSaida === null) return;
 
         saidaProcessada = true;
-        criarOuAtualizar(
+
+        if (contadorSaida === 0) {
+            criarAguardandoConfirmacao(
+                apartamentoAtual,
+                linhasSaida,
+                `${motivo}. Contador marcou zero no fechamento.`
+            );
+            return;
+        }
+
+        criarPendenciaNormal(
             apartamentoAtual,
-            quantidadeAtual,
-            encomendasAtuais,
+            contadorSaida,
+            linhasSaida,
             motivo
         );
     }
 
     function limparSessao() {
         apartamentoAtual = "";
-        quantidadeAtual = null;
-        encomendasAtuais = [];
+        contadorAtual = null;
+        linhasAtuais = [];
         saidaProcessada = false;
-        zeroApartamento = "";
-        zeroConfirmacoes = 0;
+        resetarZero();
         atualizarPainel();
     }
 
@@ -189,68 +300,22 @@
         const apartamento = encontrarApartamento();
 
         if (!apartamento) {
-            if (apartamentoAtual && quantidadeAtual > 0) {
-                registrarSaida("Campo apagado antes de concluir todas as baixas");
-            }
+            if (apartamentoAtual) registrarSaida("Campo apagado ou consulta encerrada");
             limparSessao();
             return;
         }
 
         if (apartamentoAtual && apartamentoAtual !== apartamento) {
-            if (quantidadeAtual > 0) registrarSaida("Outra unidade foi pesquisada");
+            registrarSaida("Outra unidade foi pesquisada");
             limparSessao();
         }
 
         apartamentoAtual = apartamento;
-
-        const contador = lerContador();
-        const linhas = capturarLinhas(apartamentoAtual);
-
-        if (contador === null) {
-            atualizarPainel();
-            return;
-        }
-
-        if (contador > LIMITE_SUSPEITO) {
-            console.warn("[Painel Plus] Contador suspeito ignorado", contador);
-            return;
-        }
-
-        if (contador === 0) {
-            if (confirmarZero(apartamentoAtual, contador, linhas)) {
-                quantidadeAtual = 0;
-                encomendasAtuais = [];
-                saidaProcessada = false;
-                remover(apartamentoAtual);
-            }
-            atualizarPainel();
-            return;
-        }
-
-        zeroApartamento = "";
-        zeroConfirmacoes = 0;
-        quantidadeAtual = contador;
+        contadorAtual = lerContador();
+        linhasAtuais = capturarLinhas(apartamentoAtual);
         saidaProcessada = false;
 
-        if (linhas.length) encomendasAtuais = linhas;
-
-        if (pendenciaExiste(apartamentoAtual)) {
-            criarOuAtualizar(
-                apartamentoAtual,
-                quantidadeAtual,
-                encomendasAtuais,
-                "Pendência atualizada automaticamente"
-            );
-        }
-
-        if (linhas.length && linhas.length !== contador) {
-            console.warn("[Painel Plus] Divergência", {
-                apartamento: apartamentoAtual,
-                contador,
-                linhas: linhas.length
-            });
-        }
-
+        reconciliarRegistro(apartamentoAtual, contadorAtual, linhasAtuais);
         atualizarPainel();
     }
 
@@ -266,37 +331,43 @@
     document.addEventListener("click", evento => {
         const botao = evento.target.closest("button");
         if (!botao) return;
+
         if (botao.getAttribute("data-testid") === "residence-autocomplete-clear-input-button") {
-            registrarSaida("Campo apagado antes de concluir todas as baixas");
+            registrarSaida("Campo apagado antes de finalizar a consulta");
         }
     }, true);
 
-    function fecharOuOcultar() {
-        registrarSaida("Página fechada, atualizada ou aplicativo encerrado");
+    function processarFechamento() {
+        registrarSaida("Sistema fechado, atualizado ou ocultado");
     }
 
-    window.addEventListener("pagehide", fecharOuOcultar, { capture: true });
-    window.addEventListener("beforeunload", fecharOuOcultar, { capture: true });
+    window.addEventListener("pagehide", processarFechamento, { capture: true });
+    window.addEventListener("beforeunload", processarFechamento, { capture: true });
     document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "hidden") fecharOuOcultar();
+        if (document.visibilityState === "hidden") processarFechamento();
     });
 
     function adicionarEstilo() {
         if (document.querySelector("#plusCSS")) return;
+
         const style = document.createElement("style");
         style.id = "plusCSS";
         style.textContent = `
             #botaoPainelPlus{margin-left:10px;padding:9px 14px;border:1px solid #22c55e;border-radius:8px;background:#080808;color:#22c55e;font:800 11px Arial;cursor:pointer}
-            #painelPlus{position:fixed;top:60px;right:20px;width:390px;max-height:620px;background:#050505;color:#fff;border:1px solid #22c55e;border-radius:16px;box-shadow:0 0 30px rgba(34,197,94,.28);z-index:2147483647;font-family:Arial;overflow:hidden}
+            #painelPlus{position:fixed;top:60px;right:20px;width:410px;max-height:650px;background:#050505;color:#fff;border:1px solid #22c55e;border-radius:16px;box-shadow:0 0 30px rgba(34,197,94,.28);z-index:2147483647;font-family:Arial;overflow:hidden}
             #painelPlus .topo{padding:16px;border-bottom:1px solid rgba(34,197,94,.2)}
             #painelPlus .titulo{color:#22c55e;font-size:16px;font-weight:900}
             #painelPlus .status{margin:12px;padding:10px;border:1px solid rgba(34,197,94,.2);border-radius:10px;font-size:11px;line-height:1.8}
             #painelPlus .acoes{display:flex;gap:8px;padding:0 12px 12px}
             #painelPlus button{flex:1;padding:8px;border-radius:8px;font-weight:800;cursor:pointer}
-            #painelPlus .lista{max-height:430px;overflow-y:auto;padding:0 12px 12px}
+            #painelPlus .lista{max-height:455px;overflow-y:auto;padding:0 12px 12px}
             #painelPlus .item{margin-bottom:8px;padding:10px;border:1px solid rgba(34,197,94,.2);border-radius:10px;background:#111827}
+            #painelPlus .item.confirmacao{border-color:#f59e0b;background:#1c1608}
             #painelPlus .apt{color:#22c55e;font-size:18px;font-weight:900}
+            #painelPlus .confirmacao .apt{color:#f59e0b}
             #painelPlus .meta{color:#aaa;font-size:11px;margin-top:4px}
+            #painelPlus .checks{margin:8px 0;padding:8px;border-radius:8px;background:#080808;font-size:11px;line-height:1.65}
+            #painelPlus .ok{color:#22c55e}.alerta{color:#f59e0b}.erro{color:#ef4444}
             #painelPlus .detalhes{display:none;margin-top:8px;padding-top:8px;border-top:1px solid #333;color:#ddd;font-size:10px;line-height:1.5}
             #painelPlus .vazio{padding:50px 10px;text-align:center;color:#666}
         `;
@@ -306,14 +377,16 @@
     function criarBotao() {
         adicionarEstilo();
         if (document.querySelector("#botaoPainelPlus")) return;
-        const ref = document.querySelector('button[data-testid="delivery-select-multiple-deliveries-button"]');
-        if (!ref) return;
+
+        const referencia = document.querySelector('button[data-testid="delivery-select-multiple-deliveries-button"]');
+        if (!referencia) return;
+
         const botao = document.createElement("button");
         botao.id = "botaoPainelPlus";
         botao.type = "button";
         botao.textContent = "PAINEL PLUS V1";
         botao.onclick = abrirPainel;
-        ref.insertAdjacentElement("afterend", botao);
+        referencia.insertAdjacentElement("afterend", botao);
     }
 
     function abrirPainel() {
@@ -326,11 +399,12 @@
         const painel = document.createElement("div");
         painel.id = "painelPlus";
         painel.innerHTML = `
-            <div class="topo"><div class="titulo">PAINEL PLUS V1 MODF</div></div>
+            <div class="topo"><div class="titulo">PAINEL PLUS V1 MODF · DUPLA CHECAGEM</div></div>
             <div class="status">
                 Unidade atual: <strong id="plusApt">-</strong><br>
-                Contador atual: <strong id="plusQtd">-</strong><br>
-                Pendências agrupadas: <strong id="plusTotal">0</strong>
+                X encomenda(s): <strong id="plusQtd">-</strong><br>
+                Linhas da tabela: <strong id="plusTabela">0</strong><br>
+                Registros agrupados: <strong id="plusTotal">0</strong>
             </div>
             <div class="acoes">
                 <button id="plusLimpar">LIMPAR TUDO</button>
@@ -357,7 +431,8 @@
 
         const lista = carregar();
         painel.querySelector("#plusApt").textContent = apartamentoAtual || "-";
-        painel.querySelector("#plusQtd").textContent = quantidadeAtual === null ? "-" : String(quantidadeAtual);
+        painel.querySelector("#plusQtd").textContent = contadorAtual === null ? "-" : String(contadorAtual);
+        painel.querySelector("#plusTabela").textContent = String(linhasAtuais.length);
         painel.querySelector("#plusTotal").textContent = String(lista.length);
 
         const area = painel.querySelector("#plusLista");
@@ -366,27 +441,39 @@
             return;
         }
 
-        area.innerHTML = lista.map((item, indice) => `
-            <div class="item">
-                <div class="apt">${escapar(item.apartamento)}</div>
-                <div class="meta">${item.quantidade} encomenda(s) sem baixa</div>
-                <div class="meta">${escapar(item.atualizadoEm)}</div>
-                <div class="meta">${escapar(item.motivo)}</div>
-                <button type="button" data-detalhe="${indice}">VER DETALHES</button>
-                <div class="detalhes" id="detalhe${indice}">
-                    ${(item.encomendas || []).length
-                        ? item.encomendas.map((e, i) => `
-                            <div><strong>Encomenda ${i + 1}</strong><br>
-                            Número: ${escapar(e.numero || "-")}<br>
-                            Destinatário: ${escapar(e.destinatario || "-")}<br>
-                            Status: ${escapar(e.status || "-")}<br>
-                            Data: ${escapar(e.data || "-")}</div>
-                            ${i < item.encomendas.length - 1 ? "<hr>" : ""}
-                        `).join("")
-                        : "Detalhes ainda não carregados pela tabela."}
+        area.innerHTML = lista.map((item, indice) => {
+            const aguardando = item.status === "AGUARDANDO_CONFIRMACAO";
+            const classe = aguardando ? "item confirmacao" : "item";
+            const contadorClasse = item.contadorCheck === 0 ? "ok" : "alerta";
+            const tabelaClasse = item.tabelaCheck === 0 ? "ok" : "alerta";
+
+            return `
+                <div class="${classe}">
+                    <div class="apt">${escapar(item.apartamento)}</div>
+                    <div class="meta"><strong>${escapar(item.mensagem)}</strong></div>
+                    <div class="checks">
+                        <div class="${contadorClasse}">✓ X encomenda(s): ${item.contadorCheck ?? "não lido"}</div>
+                        <div class="${tabelaClasse}">${item.tabelaCheck === 0 ? "✓" : "⚠"} Tabela detalhada: ${item.tabelaCheck ?? "não carregada"} linha(s)</div>
+                    </div>
+                    <div class="meta">Status: ${aguardando ? "BAIXA PROVÁVEL · AGUARDANDO CONFIRMAÇÃO" : "PENDENTE"}</div>
+                    <div class="meta">${escapar(item.atualizadoEm)}</div>
+                    <div class="meta">${escapar(item.motivo)}</div>
+                    <button type="button" data-detalhe="${indice}">VER DETALHES</button>
+                    <div class="detalhes" id="detalhe${indice}">
+                        ${(item.itensOriginais || []).length
+                            ? item.itensOriginais.map((e, i) => `
+                                <div><strong>Encomenda ${i + 1}</strong><br>
+                                Número: ${escapar(e.numero || "-")}<br>
+                                Destinatário: ${escapar(e.destinatario || "-")}<br>
+                                Status: ${escapar(e.status || "-")}<br>
+                                Data: ${escapar(e.data || "-")}</div>
+                                ${i < item.itensOriginais.length - 1 ? "<hr>" : ""}
+                            `).join("")
+                            : "Sem detalhes salvos pela tabela."}
+                    </div>
                 </div>
-            </div>
-        `).join("");
+            `;
+        }).join("");
 
         area.querySelectorAll("[data-detalhe]").forEach(botao => {
             botao.onclick = () => {
