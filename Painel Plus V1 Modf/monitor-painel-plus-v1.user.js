@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Monitor de Encomendas Premium + Detalhes
 // @namespace    http://tampermonkey.net/
-// @version      1.5.0
-// @description  Usa a lógica estável original e acrescenta somente detalhes e exclusão automática quando X chega a 0.
+// @version      1.5.1
+// @description  Mantém a lógica original, adiciona detalhes, auto delete por X=0 e ignora contadores de Todos/Entregues.
 // @author       Daniel Alexandre
 // @match        https://app.econdos.com.br/*
 // @run-at       document-idle
@@ -13,48 +13,41 @@
 (function () {
     "use strict";
 
-    /*
-     * IMPORTANTE
-     * ----------
-     * A lógica principal e toda a interface continuam no arquivo original:
-     * Monitor-encomendas-simples-v1.user.js
-     *
-     * Este complemento adiciona SOMENTE:
-     * 1. Detalhes das encomendas no histórico.
-     * 2. Exclusão automática do histórico quando X encomenda(s) chega a 0.
-     */
-
     const STORAGE_HISTORICO = "monitor_encomendas_simples_historico";
-    const STORAGE_CACHE_DETALHES = "monitor_encomendas_detalhes_cache_v150";
-    const INTERVALO = 700;
+    const STORAGE_DETALHES = "monitor_encomendas_detalhes_v151";
+    const ROTA = "/gate/deliveries";
+    const INTERVALO = 500;
 
-    let apartamentoMonitorado = "";
-    let ultimoX = null;
+    let apartamentoAtual = "";
+    let ultimoXValido = null;
     let detalhesAtuais = [];
+    let snapshotFiltroProtegido = null;
+    let filtroAnteriorAguardando = true;
 
-    function normalizarTexto(valor) {
-        return String(valor || "")
-            .trim()
-            .toLowerCase()
-            .normalize("NFD")
-            .replace(/[\u0300-\u036f]/g, "");
+    const normalizar = valor => String(valor || "")
+        .trim()
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "");
+
+    const escapar = valor => String(valor ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+
+    function naTelaEncomendas() {
+        return location.pathname.includes(ROTA);
     }
 
-    function escaparHTML(valor) {
-        return String(valor ?? "")
-            .replaceAll("&", "&amp;")
-            .replaceAll("<", "&lt;")
-            .replaceAll(">", "&gt;")
-            .replaceAll('"', "&quot;")
-            .replaceAll("'", "&#039;");
+    function lerHistoricoBruto() {
+        return localStorage.getItem(STORAGE_HISTORICO) || "[]";
     }
 
-    function obterHistorico() {
+    function lerHistorico() {
         try {
-            const lista = JSON.parse(
-                localStorage.getItem(STORAGE_HISTORICO) || "[]"
-            );
-
+            const lista = JSON.parse(lerHistoricoBruto());
             return Array.isArray(lista) ? lista : [];
         } catch {
             return [];
@@ -68,125 +61,128 @@
         );
     }
 
-    function obterCacheDetalhes() {
-        try {
-            const cache = JSON.parse(
-                localStorage.getItem(STORAGE_CACHE_DETALHES) || "{}"
-            );
+    function filtroAguardandoAtivo() {
+        if (!naTelaEncomendas()) return false;
 
-            return cache && typeof cache === "object" ? cache : {};
-        } catch {
-            return {};
+        const botao = [...document.querySelectorAll(
+            'button[data-testid="delivery-status-filter-button"]'
+        )].find(elemento => elemento.offsetParent !== null);
+
+        if (!botao) return false;
+
+        const texto = normalizar(
+            botao.innerText ||
+            botao.textContent ||
+            botao.getAttribute("aria-label") ||
+            botao.getAttribute("title") ||
+            ""
+        );
+
+        return texto.includes("aguardando") && texto.includes("entrega");
+    }
+
+    /*
+     * Proteção contra a lenda das 80 encomendas:
+     * ao sair de Aguardando entrega, congela o histórico existente.
+     * Enquanto estiver em Todos ou Entregues, qualquer registro criado
+     * pela lógica original usando o X errado é imediatamente desfeito.
+     */
+    function protegerHistoricoDosOutrosFiltros() {
+        const aguardando = filtroAguardandoAtivo();
+
+        if (filtroAnteriorAguardando && !aguardando) {
+            snapshotFiltroProtegido = lerHistoricoBruto();
         }
-    }
 
-    function salvarCacheDetalhes(apartamento, detalhes) {
-        if (!apartamento || !detalhes.length) return;
-
-        const cache = obterCacheDetalhes();
-        cache[apartamento] = {
-            detalhes,
-            atualizadoEm: Date.now()
-        };
-
-        localStorage.setItem(
-            STORAGE_CACHE_DETALHES,
-            JSON.stringify(cache)
-        );
-    }
-
-    // Mesma lógica do script estável original.
-    function encontrarApartamento() {
-        const inputs = Array.from(
-            document.querySelectorAll("input")
-        );
-
-        for (const input of inputs) {
-            if (input.offsetParent === null) continue;
-
-            const valor = String(input.value || "").trim();
-
-            if (/^\d+\/\d+$/.test(valor)) {
-                return valor;
+        if (!aguardando) {
+            if (snapshotFiltroProtegido === null) {
+                snapshotFiltroProtegido = lerHistoricoBruto();
             }
+
+            if (lerHistoricoBruto() !== snapshotFiltroProtegido) {
+                localStorage.setItem(
+                    STORAGE_HISTORICO,
+                    snapshotFiltroProtegido
+                );
+                atualizarPainelVisual();
+            }
+        } else {
+            snapshotFiltroProtegido = null;
         }
 
-        return "";
+        filtroAnteriorAguardando = aguardando;
+        return aguardando;
     }
 
-    // X continua sendo o veredito final.
-    function lerQuantidadeEncomendas() {
-        const elementos = Array.from(
-            document.querySelectorAll("small, span, div")
-        );
+    function encontrarApartamento() {
+        if (!naTelaEncomendas()) return "";
 
-        for (const elemento of elementos) {
+        const campo = [...document.querySelectorAll(
+            'input[data-testid="residence-autocomplete-input-search"]'
+        )].find(elemento => elemento.offsetParent !== null);
+
+        if (!campo) return "";
+
+        const valor = String(campo.value || "").trim();
+        return /^\d+\/\d+$/.test(valor) ? valor : "";
+    }
+
+    function raizTabela() {
+        if (!naTelaEncomendas()) return null;
+
+        return [...document.querySelectorAll(
+            '[data-testid="delivery-table"]'
+        )].find(elemento => elemento.offsetParent !== null) || null;
+    }
+
+    function lerXDeAguardando() {
+        if (!filtroAguardandoAtivo()) return null;
+
+        const raiz = raizTabela();
+        if (!raiz) return null;
+
+        for (const elemento of raiz.querySelectorAll(
+            "footer small, footer span, small"
+        )) {
             if (elemento.offsetParent === null) continue;
 
-            const texto = normalizarTexto(elemento.textContent);
+            const texto = normalizar(elemento.textContent);
             const match = texto.match(
-                /(?:^|\s)(\d+)\s+encomenda\(s\)(?:\s|$)/
+                /^(\d+)\s+encomenda(?:\(s\)|s)?$/
             );
 
-            if (match) {
-                return Number(match[1]);
-            }
+            if (match) return Number(match[1]);
         }
 
         return null;
     }
 
-    function encontrarRaizTabela() {
-        const porTeste = Array.from(
-            document.querySelectorAll('[data-testid="delivery-table"]')
-        ).find(elemento => elemento.offsetParent !== null);
-
-        if (porTeste) return porTeste;
-
-        return Array.from(document.querySelectorAll("table"))
-            .find(elemento => elemento.offsetParent !== null) || null;
-    }
-
     function capturarDetalhes(apartamento) {
-        if (!apartamento) return [];
+        if (!apartamento || !filtroAguardandoAtivo()) return [];
 
-        const raiz = encontrarRaizTabela();
+        const raiz = raizTabela();
         if (!raiz) return [];
 
         const resultado = [];
-        const linhas = raiz.querySelectorAll(
-            "tbody tr, [role='row'], .ag-row"
-        );
 
-        for (const linha of linhas) {
+        for (const linha of raiz.querySelectorAll(
+            "tbody tr, [role='row'], .ag-row"
+        )) {
             if (linha.offsetParent === null) continue;
 
-            const celulas = Array.from(
-                linha.querySelectorAll("td, [role='gridcell'], .ag-cell")
-            )
+            const celulas = [...linha.querySelectorAll(
+                "td, [role='gridcell'], .ag-cell"
+            )]
                 .map(celula => String(celula.innerText || "").trim())
                 .filter(Boolean);
 
             if (!celulas.length) continue;
 
-            const textoCompleto = celulas.join(" | ");
-            const unidadeEncontrada = celulas.find(
-                valor => /^\d+\/\d+$/.test(valor)
-            );
+            const texto = celulas.join(" | ");
+            const unidade = celulas.find(valor => /^\d+\/\d+$/.test(valor));
 
-            if (
-                unidadeEncontrada &&
-                unidadeEncontrada !== apartamento
-            ) {
-                continue;
-            }
-
-            if (
-                !unidadeEncontrada &&
-                !textoCompleto.includes(apartamento)
-            ) {
-                continue;
-            }
+            if (unidade && unidade !== apartamento) continue;
+            if (!unidade && !texto.includes(apartamento)) continue;
 
             resultado.push({
                 numero: celulas[0] || "",
@@ -194,145 +190,97 @@
                 destinatario: celulas[2] || "",
                 status: celulas[3] || "",
                 data: celulas[4] || "",
-                resumo: textoCompleto
+                resumo: texto
             });
         }
 
         return resultado;
     }
 
-    function enriquecerHistoricoComDetalhes() {
-        if (!apartamentoMonitorado || !detalhesAtuais.length) return;
+    function lerCache() {
+        try {
+            const cache = JSON.parse(
+                localStorage.getItem(STORAGE_DETALHES) || "{}"
+            );
+            return cache && typeof cache === "object" ? cache : {};
+        } catch {
+            return {};
+        }
+    }
 
-        const historico = obterHistorico();
+    function salvarDetalhes(apartamento, detalhes) {
+        if (!apartamento || !detalhes.length) return;
+
+        const cache = lerCache();
+        cache[apartamento] = detalhes;
+        localStorage.setItem(STORAGE_DETALHES, JSON.stringify(cache));
+
+        const historico = lerHistorico();
         let alterado = false;
 
         for (const item of historico) {
-            if (item.apartamento !== apartamentoMonitorado) continue;
-
-            const detalhesAnteriores = Array.isArray(item.detalhes)
-                ? item.detalhes
-                : [];
-
-            if (!detalhesAnteriores.length) {
-                item.detalhes = detalhesAtuais;
-                alterado = true;
-            }
+            if (item.apartamento !== apartamento) continue;
+            item.detalhes = detalhes;
+            alterado = true;
         }
 
-        if (alterado) {
-            gravarHistorico(historico);
-        }
+        if (alterado) gravarHistorico(historico);
     }
 
-    function removerApartamentoDoHistorico(apartamento) {
+    function removerHistoricoDaUnidade(apartamento) {
         if (!apartamento) return false;
 
-        const historico = obterHistorico();
-        const novoHistorico = historico.filter(
+        const historico = lerHistorico();
+        const novo = historico.filter(
             item => item.apartamento !== apartamento
         );
 
-        if (novoHistorico.length === historico.length) {
-            return false;
-        }
+        if (novo.length === historico.length) return false;
 
-        gravarHistorico(novoHistorico);
+        gravarHistorico(novo);
 
-        const cache = obterCacheDetalhes();
+        const cache = lerCache();
         delete cache[apartamento];
-        localStorage.setItem(
-            STORAGE_CACHE_DETALHES,
-            JSON.stringify(cache)
-        );
-
+        localStorage.setItem(STORAGE_DETALHES, JSON.stringify(cache));
         return true;
     }
 
-    function forcarAtualizacaoVisual() {
+    function atualizarPainelVisual() {
         const painel = document.querySelector("#painelConsultas505");
-        if (!painel) return;
+        const fechar = painel?.querySelector("#fecharPainel505");
+        const abrir = document.querySelector("#botaoMonitor505");
 
-        const botaoFechar = painel.querySelector("#fecharPainel505");
-        const botaoAbrir = document.querySelector("#botaoMonitor505");
-
-        // O script original não observa alterações externas no localStorage.
-        // Reabre somente quando o painel já estava aberto.
-        if (botaoFechar && botaoAbrir) {
-            botaoFechar.click();
-            setTimeout(() => botaoAbrir.click(), 30);
+        if (fechar && abrir) {
+            fechar.click();
+            setTimeout(() => abrir.click(), 40);
         }
     }
 
-    function aplicarAutoDeletePorX() {
-        if (!apartamentoMonitorado) return;
-        if (ultimoX !== 0) return;
+    function autoDeletePorX() {
+        if (!apartamentoAtual) return;
+        if (ultimoXValido !== 0) return;
 
-        const removeu = removerApartamentoDoHistorico(
-            apartamentoMonitorado
-        );
-
-        if (removeu) {
-            forcarAtualizacaoVisual();
+        if (removerHistoricoDaUnidade(apartamentoAtual)) {
+            atualizarPainelVisual();
         }
     }
 
-    function atualizarMonitorComplementar() {
-        const apartamento = encontrarApartamento();
-        const quantidade = lerQuantidadeEncomendas();
-
-        if (!apartamento) {
-            apartamentoMonitorado = "";
-            ultimoX = null;
-            detalhesAtuais = [];
-            decorarHistorico();
-            return;
-        }
-
-        apartamentoMonitorado = apartamento;
-
-        if (quantidade !== null) {
-            ultimoX = quantidade;
-        }
-
-        const detalhesLidos = capturarDetalhes(
-            apartamentoMonitorado
-        );
-
-        if (detalhesLidos.length) {
-            detalhesAtuais = detalhesLidos;
-            salvarCacheDetalhes(
-                apartamentoMonitorado,
-                detalhesAtuais
-            );
-            enriquecerHistoricoComDetalhes();
-        }
-
-        // X é o veredito: 2 → 1 → 0 remove tudo da unidade.
-        aplicarAutoDeletePorX();
-        decorarHistorico();
-    }
-
-    function obterDetalhesDoItem(item) {
+    function detalhesDoItem(item) {
         if (Array.isArray(item.detalhes) && item.detalhes.length) {
             return item.detalhes;
         }
 
-        const cache = obterCacheDetalhes();
-        return cache[item.apartamento]?.detalhes || [];
+        return lerCache()[item.apartamento] || [];
     }
 
     function decorarHistorico() {
-        const listaVisual = document.querySelector(
-            "#listaHistorico505"
-        );
-
+        const listaVisual = document.querySelector("#listaHistorico505");
         if (!listaVisual) return;
 
-        const historico = obterHistorico();
-        const cartoes = Array.from(
-            listaVisual.querySelectorAll(".registroSistema505")
-        );
+        const historico = lerHistorico();
+        const cartoes = [...listaVisual.querySelectorAll(
+            ".registroSistema505"
+        )];
 
         cartoes.forEach((cartao, indice) => {
             if (cartao.querySelector(".detalhesAddon505")) return;
@@ -340,8 +288,7 @@
             const item = historico[indice];
             if (!item) return;
 
-            const detalhes = obterDetalhesDoItem(item);
-
+            const detalhes = detalhesDoItem(item);
             const bloco = document.createElement("div");
             bloco.className = "detalhesAddon505";
             bloco.style.marginTop = "9px";
@@ -371,45 +318,73 @@
             conteudo.style.lineHeight = "15px";
             conteudo.style.color = "#ccc";
 
-            if (!detalhes.length) {
-                conteudo.textContent =
-                    "Os detalhes não estavam disponíveis no momento da captura.";
-            } else {
-                conteudo.innerHTML = detalhes.map((detalhe, i) => `
+            conteudo.innerHTML = detalhes.length
+                ? detalhes.map((detalhe, i) => `
                     <div style="margin-bottom:${i < detalhes.length - 1 ? "9px" : "0"}">
                         <b style="color:#22c55e">Encomenda ${i + 1}</b><br>
-                        Número: ${escaparHTML(detalhe.numero || "-")}<br>
-                        Destinatário: ${escaparHTML(detalhe.destinatario || "-")}<br>
-                        Status: ${escaparHTML(detalhe.status || "-")}<br>
-                        Data: ${escaparHTML(detalhe.data || "-")}
+                        Número: ${escapar(detalhe.numero || "-")}<br>
+                        Destinatário: ${escapar(detalhe.destinatario || "-")}<br>
+                        Status: ${escapar(detalhe.status || "-")}<br>
+                        Data: ${escapar(detalhe.data || "-")}
                     </div>
-                `).join("");
-            }
+                `).join("")
+                : "Os detalhes não estavam disponíveis no momento da captura.";
 
-            botao.addEventListener("click", () => {
+            botao.onclick = () => {
                 const abrir = conteudo.style.display !== "block";
                 conteudo.style.display = abrir ? "block" : "none";
                 botao.textContent = abrir
                     ? "OCULTAR DETALHES"
                     : "VER DETALHES";
-            });
+            };
 
-            bloco.appendChild(botao);
-            bloco.appendChild(conteudo);
+            bloco.append(botao, conteudo);
             cartao.appendChild(bloco);
         });
     }
 
-    setInterval(atualizarMonitorComplementar, INTERVALO);
+    function sincronizarComplemento() {
+        const aguardando = protegerHistoricoDosOutrosFiltros();
 
-    const observadorPainel = new MutationObserver(() => {
+        if (!aguardando) {
+            decorarHistorico();
+            return;
+        }
+
+        const apartamento = encontrarApartamento();
+        const quantidade = lerXDeAguardando();
+
+        if (!apartamento) {
+            apartamentoAtual = "";
+            ultimoXValido = null;
+            detalhesAtuais = [];
+            decorarHistorico();
+            return;
+        }
+
+        apartamentoAtual = apartamento;
+
+        if (quantidade !== null) {
+            ultimoXValido = quantidade;
+        }
+
+        const detalhes = capturarDetalhes(apartamentoAtual);
+        if (detalhes.length) {
+            detalhesAtuais = detalhes;
+            salvarDetalhes(apartamentoAtual, detalhesAtuais);
+        }
+
+        // O X de Aguardando entrega é o veredito final.
+        autoDeletePorX();
         decorarHistorico();
-    });
+    }
 
-    observadorPainel.observe(document.documentElement, {
-        childList: true,
-        subtree: true
-    });
+    setInterval(sincronizarComplemento, INTERVALO);
 
-    atualizarMonitorComplementar();
+    new MutationObserver(decorarHistorico).observe(
+        document.documentElement,
+        { childList: true, subtree: true }
+    );
+
+    sincronizarComplemento();
 })();
