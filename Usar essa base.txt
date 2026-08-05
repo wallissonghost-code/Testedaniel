@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Monitor v505 - Base corrigida
 // @namespace    http://tampermonkey.net/
-// @version      505.1
+// @version      505.2
 // @description  Monitora somente Aguardando entrega, pausa em Todos/Entregues e registra apenas em saídas reais
 // @author       Daniel Alexandre
 // @match        https://app.econdos.com.br/*
@@ -96,16 +96,28 @@
     }
 
     function lerUnidadeSelecionada() {
-        const campo = Array.from(
-            document.querySelectorAll(
-                'input[data-testid="residence-autocomplete-input-search"]'
-            )
-        ).find(el => el.offsetParent !== null);
+        const inputsVisiveis = Array.from(document.querySelectorAll("input"))
+            .filter(input => input.offsetParent !== null && !input.disabled);
 
-        if (!campo) return "";
+        // Prioriza o campo específico quando ele existir.
+        const campoPreferido = inputsVisiveis.find(input =>
+            input.getAttribute("data-testid") ===
+            "residence-autocomplete-input-search"
+        );
 
-        const valor = String(campo.value || "").trim();
-        return /^\d+\/\d+$/.test(valor) ? valor : "";
+        if (campoPreferido) {
+            const valor = String(campoPreferido.value || "").trim();
+            if (/^\d+\/\d+$/.test(valor)) return valor;
+        }
+
+        // Fallback da versão Premium funcional: procura qualquer input
+        // visível que contenha exatamente uma unidade no formato 2/202.
+        for (const input of inputsVisiveis) {
+            const valor = String(input.value || "").trim();
+            if (/^\d+\/\d+$/.test(valor)) return valor;
+        }
+
+        return "";
     }
 
     function lerX() {
@@ -188,7 +200,6 @@
     }
 
     function sincronizar() {
-        // Saída real: registra antes de apagar o estado.
         if (location.href !== ultimaURL) {
             salvarPendencia("Saiu da página de encomendas");
             ultimaURL = location.href;
@@ -198,14 +209,11 @@
 
         const modo = modoFiltro();
 
-        // Todos e Entregues apenas pausam. Não leem X e não apagam a sessão.
         if (modo === "todos" || modo === "entregues") {
             atualizarPainel();
             return;
         }
 
-        // O React pode desmontar o filtro durante a navegação.
-        // Não apaga a memória; URL/lixeira/fechamento decidem a saída.
         if (modo === "outro") {
             atualizarPainel();
             return;
@@ -378,7 +386,7 @@
         painel.innerHTML = `
             <canvas id="matrix505" style="position:absolute;inset:0;width:100%;height:100%;opacity:.12;pointer-events:none"></canvas>
             <div class="conteudo505">
-                <div class="topo505"><div><div class="titulo505">MONITOR DE ENCOMENDAS</div><div class="subtitulo505">SYSTEM ONLINE · V505.1</div></div><div class="led505"></div></div>
+                <div class="topo505"><div><div class="titulo505">MONITOR DE ENCOMENDAS</div><div class="subtitulo505">SYSTEM ONLINE · V505.2</div></div><div class="led505"></div></div>
                 <div class="status505">
                     <div class="linha505"><span>FILTRO</span><span id="filtro505" class="valor505">AGUARDANDO</span></div>
                     <div class="linha505"><span>UNIDADE</span><span id="unidade505" class="valor505">NENHUMA</span></div>
@@ -480,7 +488,7 @@
         adicionarEstilo();
         criarBotao();
         sincronizar();
-        registrarEvento("SISTEMA", "Monitor v505.1 iniciado", "MONITORAMENTO ATIVO");
+        registrarEvento("SISTEMA", "Monitor v505.2 iniciado", "MONITORAMENTO ATIVO");
     }
 
     if (document.readyState === "loading") {
