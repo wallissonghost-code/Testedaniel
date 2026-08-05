@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Último Teste - Monitor de Encomendas Premium
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
-// @description  Painel Premium V505: monitora apenas Aguardando entrega e remove automaticamente do histórico quando X chega a 0.
+// @version      1.0.1
+// @description  Painel Premium V505: monitora apenas Aguardando entrega, registra ao trocar de tela e remove do histórico quando X chega a 0.
 // @author       Daniel Alexandre
 // @match        https://app.econdos.com.br/*
 // @run-at       document-idle
@@ -15,7 +15,11 @@
 
     const STORAGE_HISTORICO = "monitor_encomendas_simples_historico";
     const INTERVALO = 300;
+
     let escritaInterna = false;
+    let ultimoFiltroConfiavelFoiAguardando = false;
+    let ultimaURLConfiavel = location.href;
+    let liberacaoDeSaidaConsumida = false;
 
     const setItemOriginal = Storage.prototype.setItem;
 
@@ -48,12 +52,49 @@
         return texto.includes("aguardando") && texto.includes("entrega");
     }
 
-    // Impede que o script-base grave histórico usando X de Todos ou Entregues.
+    function atualizarContextoConfiavel() {
+        if (filtroAguardandoAtivo()) {
+            ultimoFiltroConfiavelFoiAguardando = true;
+            ultimaURLConfiavel = location.href;
+            liberacaoDeSaidaConsumida = false;
+            return;
+        }
+
+        // Se continua na mesma URL, significa troca de filtro para Todos/Entregues.
+        // Nesse caso, bloqueia imediatamente qualquer gravação nova.
+        if (location.href === ultimaURLConfiavel) {
+            ultimoFiltroConfiavelFoiAguardando = false;
+            liberacaoDeSaidaConsumida = false;
+        }
+    }
+
+    function podeGravarHistoricoAgora() {
+        if (filtroAguardandoAtivo()) return true;
+
+        // Ao trocar de tela, o filtro some antes de o script-base salvar.
+        // Permite exatamente uma gravação usando o último contexto confiável.
+        const trocouDeTela = location.href !== ultimaURLConfiavel;
+
+        if (
+            trocouDeTela &&
+            ultimoFiltroConfiavelFoiAguardando &&
+            !liberacaoDeSaidaConsumida
+        ) {
+            liberacaoDeSaidaConsumida = true;
+            ultimoFiltroConfiavelFoiAguardando = false;
+            ultimaURLConfiavel = location.href;
+            return true;
+        }
+
+        return false;
+    }
+
+    // Bloqueia o X de Todos/Entregues, mas preserva a gravação ao trocar de tela.
     Storage.prototype.setItem = function (chave, valor) {
         if (
             String(chave) === STORAGE_HISTORICO &&
             !escritaInterna &&
-            !filtroAguardandoAtivo()
+            !podeGravarHistoricoAgora()
         ) {
             return;
         }
@@ -124,7 +165,10 @@
 
         if (novo.length === historico.length) return false;
 
-        salvarDireto(STORAGE_HISTORICO, JSON.stringify(novo.slice(0, 500)));
+        salvarDireto(
+            STORAGE_HISTORICO,
+            JSON.stringify(novo.slice(0, 500))
+        );
         return true;
     }
 
@@ -153,6 +197,7 @@
     }
 
     function sincronizar() {
+        atualizarContextoConfiavel();
         atualizarPainelVisual();
 
         if (!filtroAguardandoAtivo()) return;
