@@ -1,399 +1,52 @@
 // ==UserScript==
 // @name         Painel Plus V1 Modf
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
-// @description  Contador rápido + tabela detalhada + histórico conservador por unidade.
+// @version      1.3.1
+// @description  Monitora apenas Aguardando entrega, salva detalhes da tabela e confirma baixa por X encomenda(s).
 // @author       Daniel Alexandre
 // @match        https://app.econdos.com.br/*
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
-
-(function () {
-    "use strict";
-
-    const STORAGE = "painel_plus_v1_modf_pendencias";
-    const INTERVALO = 800;
-
-    let aptAtual = "";
-    let contadorAtual = null;
-    let linhasAtuais = [];
-    let ultimaURL = location.href;
-    let saidaProcessada = false;
-
-    function norm(v) {
-        return String(v || "").trim().toLowerCase()
-            .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-    }
-
-    function esc(v) {
-        return String(v ?? "")
-            .replaceAll("&", "&amp;")
-            .replaceAll("<", "&lt;")
-            .replaceAll(">", "&gt;")
-            .replaceAll('"', "&quot;")
-            .replaceAll("'", "&#039;");
-    }
-
-    function carregar() {
-        try {
-            const lista = JSON.parse(localStorage.getItem(STORAGE) || "[]");
-            return Array.isArray(lista) ? lista : [];
-        } catch {
-            return [];
-        }
-    }
-
-    function salvar(lista) {
-        localStorage.setItem(STORAGE, JSON.stringify(lista.slice(0, 500)));
-        atualizarPainel();
-    }
-
-    function aptTela() {
-        for (const input of document.querySelectorAll("input")) {
-            if (input.offsetParent === null) continue;
-            const v = String(input.value || "").trim();
-            if (/^\d+\/\d+$/.test(v)) return v;
-        }
-        return "";
-    }
-
-    function contadorTela() {
-        for (const el of document.querySelectorAll("small, span")) {
-            if (el.offsetParent === null) continue;
-            const m = norm(el.textContent).match(/(?:^|\s)(\d+)\s+encomenda(?:\(s\)|s)?(?:\s|$)/);
-            if (m) return Number(m[1]);
-        }
-        return null;
-    }
-
-    function tabelaTela() {
-        for (const t of document.querySelectorAll("table")) {
-            if (t.offsetParent === null) continue;
-            const txt = norm(t.innerText);
-            if (txt.includes("encomenda") || txt.includes("destinatario") || txt.includes("residencia")) return t;
-        }
-        return null;
-    }
-
-    function linhasDoApt(apt) {
-        const tabela = tabelaTela();
-        if (!tabela) return [];
-        const lista = [];
-
-        for (const tr of tabela.querySelectorAll("tbody tr")) {
-            if (tr.offsetParent === null) continue;
-            const c = Array.from(tr.querySelectorAll("td")).map(td => td.innerText.trim());
-            const unidade = c.find(v => /^\d+\/\d+$/.test(v)) || "";
-            if (unidade !== apt) continue;
-
-            lista.push({
-                numero: c[0] || "",
-                apartamento: unidade,
-                destinatario: c[2] || "",
-                status: c[3] || "",
-                data: c[4] || "",
-                resumo: c.join(" | ")
-            });
-        }
-        return lista;
-    }
-
-    function chave(item) {
-        return [item.numero, item.apartamento, item.destinatario, item.status, item.data, item.resumo].join("|");
-    }
-
-    function registro(apt) {
-        return carregar().find(item => item.apartamento === apt) || null;
-    }
-
-    function gravarRegistro(dados) {
-        const lista = carregar();
-        const i = lista.findIndex(item => item.apartamento === dados.apartamento);
-        const anterior = i >= 0 ? lista[i] : null;
-
-        const novo = {
-            apartamento: dados.apartamento,
-            status: dados.status,
-            quantidade: dados.quantidade,
-            itensOriginais: dados.itensOriginais ?? anterior?.itensOriginais ?? [],
-            itensPendentes: dados.itensPendentes ?? anterior?.itensPendentes ?? [],
-            mensagem: dados.mensagem,
-            motivo: dados.motivo || anterior?.motivo || "",
-            atualizadoEm: new Date().toLocaleString("pt-BR"),
-            timestamp: Date.now()
-        };
-
-        if (i >= 0) lista[i] = novo;
-        else lista.unshift(novo);
-        salvar(lista);
-    }
-
-    function remover(apt) {
-        const lista = carregar();
-        const nova = lista.filter(item => item.apartamento !== apt);
-        if (nova.length !== lista.length) salvar(nova);
-    }
-
-    function antigasAindaPresentes(reg, atuais) {
-        const atuaisSet = new Set(atuais.map(chave));
-        return (reg.itensPendentes || reg.itensOriginais || []).filter(item => atuaisSet.has(chave(item)));
-    }
-
-    function reconciliar(apt, contador, linhas) {
-        const reg = registro(apt);
-        if (!reg) return;
-
-        if (contador === 0) {
-            remover(apt);
-            return;
-        }
-
-        if (!linhas.length) return;
-
-        const antigas = antigasAindaPresentes(reg, linhas);
-
-        if (!antigas.length) {
-            // As antigas sumiram. As linhas atuais são novas e não pertencem à ocorrência velha.
-            remover(apt);
-            return;
-        }
-
-        gravarRegistro({
-            apartamento: apt,
-            status: "PENDENTE",
-            quantidade: antigas.length,
-            itensOriginais: reg.itensOriginais,
-            itensPendentes: antigas,
-            mensagem: `${antigas.length} encomenda(s) antiga(s) ainda sem baixa.`,
-            motivo: "Reconciliação automática após reabrir a unidade"
-        });
-    }
-
-    function registrarSaida(motivo) {
-        if (saidaProcessada || !aptAtual || contadorAtual === null) return;
-        saidaProcessada = true;
-
-        if (contadorAtual === 0) {
-            const reg = registro(aptAtual);
-            if (reg) {
-                gravarRegistro({
-                    apartamento: aptAtual,
-                    status: "BAIXA PROVÁVEL",
-                    quantidade: 0,
-                    itensOriginais: reg.itensOriginais,
-                    itensPendentes: reg.itensPendentes,
-                    mensagem: "X encomenda(s) chegou a 0, mas o sistema foi fechado antes da tabela confirmar.",
-                    motivo
-                });
-            }
-            return;
-        }
-
-        const detalhes = linhasAtuais.length ? linhasAtuais : (registro(aptAtual)?.itensPendentes || []);
-
-        gravarRegistro({
-            apartamento: aptAtual,
-            status: "PENDENTE",
-            quantidade: contadorAtual,
-            itensOriginais: detalhes,
-            itensPendentes: detalhes,
-            mensagem: `${contadorAtual} encomenda(s) sem baixa.`,
-            motivo
-        });
-    }
-
-    function limparSessao() {
-        aptAtual = "";
-        contadorAtual = null;
-        linhasAtuais = [];
-        saidaProcessada = false;
-        atualizarPainel();
-    }
-
-    function sincronizar() {
-        const apt = aptTela();
-
-        if (!apt) {
-            if (aptAtual) registrarSaida("Campo apagado ou consulta encerrada");
-            limparSessao();
-            return;
-        }
-
-        if (aptAtual && aptAtual !== apt) {
-            registrarSaida("Outra unidade foi pesquisada");
-            limparSessao();
-        }
-
-        aptAtual = apt;
-        contadorAtual = contadorTela();
-        linhasAtuais = linhasDoApt(aptAtual);
-        saidaProcessada = false;
-
-        if (contadorAtual !== null) reconciliar(aptAtual, contadorAtual, linhasAtuais);
-        atualizarPainel();
-    }
-
-    setInterval(() => {
-        if (location.href !== ultimaURL) {
-            registrarSaida("Saiu da tela de encomendas");
-            ultimaURL = location.href;
-            limparSessao();
-        }
-        sincronizar();
-    }, INTERVALO);
-
-    document.addEventListener("click", evento => {
-        const botao = evento.target.closest("button");
-        if (!botao) return;
-        if (botao.getAttribute("data-testid") === "residence-autocomplete-clear-input-button") {
-            registrarSaida("Campo apagado antes de concluir a consulta");
-        }
-    }, true);
-
-    function fechar(motivo) {
-        registrarSaida(motivo);
-    }
-
-    window.addEventListener("pagehide", () => fechar("Página fechada ou atualizada"), { capture: true });
-    window.addEventListener("beforeunload", () => fechar("Aplicativo ou navegador encerrado"), { capture: true });
-    document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "hidden") fechar("Aba ou aplicativo ficou oculto");
-    });
-
-    function estilo() {
-        if (document.querySelector("#plusCSS")) return;
-        const s = document.createElement("style");
-        s.id = "plusCSS";
-        s.textContent = `
-            #botaoPainelPlus{margin-left:10px;padding:9px 14px;border:1px solid #22c55e;border-radius:8px;background:#080808;color:#22c55e;font:800 11px Arial;cursor:pointer}
-            #painelPlus{position:fixed;top:60px;right:20px;width:410px;max-height:650px;background:#050505;color:#fff;border:1px solid #22c55e;border-radius:16px;box-shadow:0 0 30px rgba(34,197,94,.28);z-index:2147483647;font-family:Arial;overflow:hidden}
-            #painelPlus .topo{padding:16px;border-bottom:1px solid rgba(34,197,94,.2)}
-            #painelPlus .titulo{color:#22c55e;font-size:16px;font-weight:900}
-            #painelPlus .status{margin:12px;padding:10px;border:1px solid rgba(34,197,94,.2);border-radius:10px;font-size:11px;line-height:1.8}
-            #painelPlus .acoes{display:flex;gap:8px;padding:0 12px 12px}
-            #painelPlus button{flex:1;padding:8px;border-radius:8px;font-weight:800;cursor:pointer}
-            #painelPlus .lista{max-height:455px;overflow-y:auto;padding:0 12px 12px}
-            #painelPlus .item{margin-bottom:8px;padding:10px;border:1px solid rgba(34,197,94,.2);border-radius:10px;background:#111827}
-            #painelPlus .item.provavel{border-color:#60a5fa;background:#0b1628}
-            #painelPlus .apt{color:#22c55e;font-size:18px;font-weight:900}
-            #painelPlus .provavel .apt{color:#60a5fa}
-            #painelPlus .meta{color:#aaa;font-size:11px;margin-top:4px}
-            #painelPlus .checks{margin:8px 0;padding:8px;border-radius:8px;background:#080808;font-size:11px;line-height:1.65}
-            #painelPlus .ok{color:#22c55e}.alerta{color:#f59e0b}.azul{color:#60a5fa}
-            #painelPlus .detalhes{display:none;margin-top:8px;padding-top:8px;border-top:1px solid #333;color:#ddd;font-size:10px;line-height:1.5}
-            #painelPlus .vazio{padding:50px 10px;text-align:center;color:#666}
-        `;
-        document.head.appendChild(s);
-    }
-
-    function criarBotao() {
-        estilo();
-        if (document.querySelector("#botaoPainelPlus")) return;
-        const ref = document.querySelector('button[data-testid="delivery-select-multiple-deliveries-button"]');
-        if (!ref) return;
-        const b = document.createElement("button");
-        b.id = "botaoPainelPlus";
-        b.type = "button";
-        b.textContent = "PAINEL PLUS V1";
-        b.onclick = abrirPainel;
-        ref.insertAdjacentElement("afterend", b);
-    }
-
-    function abrirPainel() {
-        const antigo = document.querySelector("#painelPlus");
-        if (antigo) {
-            antigo.remove();
-            return;
-        }
-
-        const p = document.createElement("div");
-        p.id = "painelPlus";
-        p.innerHTML = `
-            <div class="topo"><div class="titulo">PAINEL PLUS V1 MODF</div></div>
-            <div class="status">
-                Unidade atual: <strong id="plusApt">-</strong><br>
-                X encomenda(s): <strong id="plusQtd">-</strong><br>
-                Linhas detalhadas: <strong id="plusLinhas">0</strong><br>
-                Registros: <strong id="plusTotal">0</strong>
-            </div>
-            <div class="acoes">
-                <button id="plusLimpar">LIMPAR TUDO</button>
-                <button id="plusFechar">FECHAR</button>
-            </div>
-            <div id="plusLista" class="lista"></div>
-        `;
-        document.body.appendChild(p);
-
-        p.querySelector("#plusLimpar").onclick = () => {
-            if (confirm("Deseja apagar todos os registros?")) {
-                localStorage.removeItem(STORAGE);
-                atualizarPainel();
-            }
-        };
-        p.querySelector("#plusFechar").onclick = () => p.remove();
-        atualizarPainel();
-    }
-
-    function atualizarPainel() {
-        const p = document.querySelector("#painelPlus");
-        if (!p) return;
-
-        const lista = carregar();
-        p.querySelector("#plusApt").textContent = aptAtual || "-";
-        p.querySelector("#plusQtd").textContent = contadorAtual === null ? "-" : String(contadorAtual);
-        p.querySelector("#plusLinhas").textContent = String(linhasAtuais.length);
-        p.querySelector("#plusTotal").textContent = String(lista.length);
-
-        const area = p.querySelector("#plusLista");
-        if (!lista.length) {
-            area.innerHTML = '<div class="vazio">SEM REGISTROS</div>';
-            return;
-        }
-
-        area.innerHTML = lista.map((item, i) => {
-            const provavel = item.status === "BAIXA PROVÁVEL";
-            return `
-                <div class="item ${provavel ? "provavel" : ""}">
-                    <div class="apt">${esc(item.apartamento)}</div>
-                    <div class="meta ${provavel ? "azul" : "alerta"}">${esc(item.status)}</div>
-                    <div class="checks">
-                        <div class="ok">✓ X encomenda(s): ${esc(item.quantidade)}</div>
-                        <div class="ok">✓ Linhas antigas salvas: ${(item.itensPendentes || []).length}</div>
-                    </div>
-                    <div class="meta">${esc(item.mensagem)}</div>
-                    <div class="meta">${esc(item.motivo || "")}</div>
-                    <div class="meta">${esc(item.atualizadoEm)}</div>
-                    <button type="button" data-det="${i}">VER DETALHES</button>
-                    <div class="detalhes" id="det${i}">
-                        ${(item.itensPendentes || []).length
-                            ? item.itensPendentes.map((e, n) => `
-                                <div><strong>Encomenda ${n + 1}</strong><br>
-                                Número: ${esc(e.numero || "-")}<br>
-                                Destinatário: ${esc(e.destinatario || "-")}<br>
-                                Status: ${esc(e.status || "-")}<br>
-                                Data: ${esc(e.data || "-")}</div>
-                                ${n < item.itensPendentes.length - 1 ? "<hr>" : ""}
-                            `).join("")
-                            : "Sem detalhes salvos."}
-                    </div>
-                </div>
-            `;
-        }).join("");
-
-        area.querySelectorAll("[data-det]").forEach(b => {
-            b.onclick = () => {
-                const d = area.querySelector(`#det${b.dataset.det}`);
-                const abrir = d.style.display !== "block";
-                d.style.display = abrir ? "block" : "none";
-                b.textContent = abrir ? "OCULTAR DETALHES" : "VER DETALHES";
-            };
-        });
-    }
-
-    const observer = new MutationObserver(criarBotao);
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-
-    criarBotao();
-    sincronizar();
+(function(){
+'use strict';
+const SH='painel_plus_historico_v131',SS='painel_plus_sessao_v131',ROTA='/gate/deliveries';
+let apt='',x=null,linhas=[],url=location.href,saida=false,logs=[],matrixTimer=null;
+const norm=v=>String(v||'').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+const esc=v=>String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;');
+const naTela=()=>location.pathname.includes(ROTA);
+function lerHist(){try{const a=JSON.parse(localStorage.getItem(SH)||'[]');return Array.isArray(a)?a:[]}catch{return[]}}
+function salvarHist(a){localStorage.setItem(SH,JSON.stringify(a.slice(0,500)));render()}
+function log(t,m){logs.unshift({t,m,h:new Date().toLocaleTimeString('pt-BR')});logs=logs.slice(0,100);render()}
+function campo(){if(!naTela())return null;return [...document.querySelectorAll('app-residence-autocomplete input[data-testid="residence-autocomplete-input-search"]')].find(e=>e.offsetParent!==null)||null}
+function unidade(){const e=campo(),v=String(e?.value||'').trim();return /^\d+\/\d+$/.test(v)?v:''}
+function filtro(){const b=[...document.querySelectorAll('button[data-testid="delivery-status-filter-button"]')].find(e=>e.offsetParent!==null);return norm(b?.innerText||b?.textContent||b?.title||b?.getAttribute('aria-label')||'')}
+function aguardando(){const f=filtro();return f.includes('aguardando')&&f.includes('entrega')}
+function contador(){if(!naTela()||!aguardando())return null;for(const e of document.querySelectorAll('small,span')){if(e.offsetParent===null)continue;const m=norm(e.textContent).match(/(?:^|\s)(\d+)\s+encomenda(?:\(s\)|s)?(?:\s|$)/);if(m)return Number(m[1])}return null}
+function tabela(){for(const t of document.querySelectorAll('table')){if(t.offsetParent===null)continue;const z=norm(t.innerText);if(z.includes('enviado para')||z.includes('destinatario')||z.includes('status'))return t}return null}
+function detalhes(u){const t=tabela(),r=[];if(!t||!u)return r;for(const tr of t.querySelectorAll('tbody tr')){if(tr.offsetParent===null)continue;const c=[...tr.querySelectorAll('td')].map(td=>td.innerText.trim()),un=c.find(v=>/^\d+\/\d+$/.test(v))||'';if(un!==u)continue;r.push({numero:c[0]||'',unidade:un,destinatario:c[2]||'',status:c[3]||'',data:c[4]||'',resumo:c.join(' | ')})}return r}
+const chave=i=>[i.numero,i.unidade,i.destinatario,i.status,i.data,i.resumo].join('|');
+function upsert(u,q,d,m){if(!u||q<=0)return;const a=lerHist(),i=a.findIndex(v=>v.unidade===u),ant=i>=0?a[i]:null,n={unidade:u,quantidade:q,detalhes:d.length?d:(ant?.detalhes||[]),motivo:m,atualizadoEm:new Date().toLocaleString('pt-BR'),timestamp:Date.now()};i>=0?a[i]=n:a.unshift(n);salvarHist(a)}
+function remover(u){const a=lerHist(),n=a.filter(v=>v.unidade!==u);if(n.length!==a.length)salvarHist(n)}
+function reconciliar(u,q,d){const a=lerHist(),i=a.findIndex(v=>v.unidade===u);if(i<0)return;if(q===0){remover(u);return}const old=a[i];if(!d.length||!(old.detalhes||[]).length){upsert(u,q,d,'Quantidade atualizada pelo X de Aguardando entrega.');return}const set=new Set(d.map(chave)),rest=old.detalhes.filter(v=>set.has(chave(v)));if(!rest.length){remover(u);return}upsert(u,Math.min(q,rest.length),rest,'Pendência antiga conferida na tabela.')}
+function salvarSessao(){localStorage.setItem(SS,JSON.stringify({apt,x,linhas,aguardando:aguardando(),ts:Date.now()}))}
+function registrarSaida(m){if(saida||!apt||x===null)return;saida=true;if(x===0){remover(apt);log('BAIXA',`${apt}: X chegou a 0`);return}upsert(apt,x,linhas,m);log('PENDÊNCIA',`${apt}: ${x} restante(s)`)}
+function reset(){apt='';x=null;linhas=[];saida=false;localStorage.removeItem(SS);render()}
+function sync(){if(!naTela())return;const u=unidade();if(!u){if(apt)registrarSaida('Campo apagado ou unidade abandonada.');reset();return}if(apt&&apt!==u){registrarSaida('Outra unidade foi pesquisada.');apt=u;x=null;linhas=[];saida=false}else apt=u;if(!aguardando()){salvarSessao();render();return}const nx=contador();if(nx===null){render();return}const nd=detalhes(apt),ant=x;x=nx;if(nd.length||nx===0)linhas=nd;saida=false;salvarSessao();if(ant!==nx)log('CONTADOR',`${apt}: ${ant??'-'} → ${nx}`);if(lerHist().some(v=>v.unidade===apt))reconciliar(apt,nx,linhas);if(nx===0)remover(apt);render()}
+setInterval(()=>{if(location.href!==url){if(url.includes(ROTA))registrarSaida('Saiu da tela de encomendas.');url=location.href;if(!naTela())reset()}sync();botao()},500);
+document.addEventListener('click',e=>{const b=e.target.closest('button');if(b?.getAttribute('data-testid')==='residence-autocomplete-clear-input-button')registrarSaida('Campo apagado antes da baixa.')},true);
+window.addEventListener('pagehide',()=>registrarSaida('Página fechada ou atualizada.'),{capture:true});
+window.addEventListener('beforeunload',()=>registrarSaida('Aplicativo ou navegador encerrado.'),{capture:true});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')registrarSaida('Aba ou aplicativo ficou oculto.')});
+function css(){if(document.querySelector('#pp505css'))return;const s=document.createElement('style');s.id='pp505css';s.textContent=`
+#ppBtn{display:inline-flex!important;align-items:center;gap:8px;margin-left:10px!important}.ppLed{width:8px;height:8px;border-radius:50%;background:#22c55e;box-shadow:0 0 12px #22c55e;animation:ppBlink 1s infinite}@keyframes ppBlink{50%{opacity:.3}}
+#ppTip{display:none;position:fixed;width:320px;padding:15px;background:#050505;border:1px solid #22c55e;border-radius:12px;z-index:2147483647;box-shadow:0 0 30px rgba(34,197,94,.35);color:#aaa;font:12px/18px Arial}.ppTT{color:#22c55e;font-weight:bold;font-size:14px;margin-bottom:10px}.ppTA{margin-top:10px;text-align:right;color:#22c55e;font-size:11px}
+#ppPanel,#ppPanel *{box-sizing:border-box;font-family:Arial}#ppPanel{position:fixed;top:60px;right:25px;width:410px;height:610px;background:#050505;color:#fff;z-index:2147483646;border-radius:18px;overflow:hidden;border:1px solid #22c55e;box-shadow:0 0 35px rgba(34,197,94,.35)}#ppCanvas{position:absolute;inset:0;width:100%;height:100%;opacity:.12;pointer-events:none}.ppBody{position:relative;z-index:2;padding:18px;height:100%;display:flex;flex-direction:column}.ppTop{display:flex;justify-content:space-between}.ppTitle{font-size:18px;font-weight:bold;color:#22c55e;text-shadow:0 0 15px #22c55e}.ppSub{font-size:10px;color:#777;margin-top:5px;letter-spacing:2px}.ppStatus{margin-top:15px;padding:12px;border-radius:12px;background:#000b;border:1px solid #22c55e44;font-size:12px;line-height:20px}.ppRow{display:flex;justify-content:space-between;gap:10px}.ppVal{color:#22c55e;font-weight:bold;text-align:right}.ppTabs,.ppAct{display:flex;gap:8px;margin-top:10px}.ppTabs button,.ppAct button{flex:1;padding:8px;border-radius:9px;font-size:10px;font-weight:bold;cursor:pointer;background:#111827;color:#888;border:1px solid #22c55e44}.ppTabs .on{color:#22c55e;border-color:#22c55e}.ppArea{flex:1;min-height:0;margin-top:12px;overflow:auto}.ppItem{background:#111827e8;border:1px solid #22c55e33;padding:12px;border-radius:12px;margin-bottom:9px}.ppApt{font-size:18px;font-weight:bold;color:#22c55e}.ppMeta{font-size:10px;color:#fbbf24;margin-top:5px}.ppEmpty{text-align:center;margin-top:80px;color:#555;letter-spacing:2px}.ppFoot{text-align:center;font-size:9px;color:#777;padding-top:8px}
+`;document.head.appendChild(s)}
+function tooltip(b){document.querySelector('#ppTip')?.remove();const t=document.createElement('div');t.id='ppTip';t.innerHTML=`<div class="ppTT">MONITOR DE ENCOMENDAS</div>O monitor acompanha somente o campo específico da tela de Encomendas.<br><br>O número oficial vem de <b style="color:#22c55e">X encomenda(s)</b> apenas no filtro <b style="color:#22c55e">Aguardando entrega</b>.<br><br>Todos e Entregues podem ser usados normalmente; seus números são ignorados.<br><br>A tabela guarda data, horário, destinatário e status para o botão Detalhes.<br><br>Quando X chega a 0, a baixa é concluída imediatamente.<div class="ppTA">Criado por Daniel Alexandre</div>`;document.body.appendChild(t);b.onmouseenter=()=>{const r=b.getBoundingClientRect();t.style.display='block';t.style.top=`${Math.min(innerHeight-t.offsetHeight-10,r.bottom+8)}px`;t.style.left=`${Math.max(10,Math.min(innerWidth-330,r.left))}px`};b.onmouseleave=()=>t.style.display='none'}
+function botao(){css();if(!naTela()){document.querySelector('#ppBtn')?.remove();document.querySelector('#ppTip')?.remove();return}if(document.querySelector('#ppBtn'))return;const ref=document.querySelector('button[data-testid="delivery-select-multiple-deliveries-button"]');if(!ref)return;const b=document.createElement('button');b.id='ppBtn';b.type='button';b.className=ref.className;b.innerHTML='MONITOR DE ENCOMENDAS <span class="ppLed"></span>';b.onclick=abrir;ref.insertAdjacentElement('afterend',b);tooltip(b)}
+function abrir(){const old=document.querySelector('#ppPanel');if(old){old.remove();clearInterval(matrixTimer);return}const p=document.createElement('div');p.id='ppPanel';p.innerHTML=`<canvas id="ppCanvas"></canvas><div class="ppBody"><div class="ppTop"><div><div class="ppTitle">MONITOR DE ENCOMENDAS</div><div class="ppSub">SYSTEM ONLINE · V1.3</div></div><span class="ppLed"></span></div><div class="ppStatus"><div class="ppRow"><span>UNIDADE</span><span class="ppVal" id="pA">NENHUMA</span></div><div class="ppRow"><span>FILTRO</span><span class="ppVal" id="pF">-</span></div><div class="ppRow"><span>X ENCOMENDA(S)</span><span class="ppVal" id="pX">-</span></div><div class="ppRow"><span>REGISTROS</span><span class="ppVal" id="pR">0</span></div><div class="ppRow"><span>ÚLTIMA AÇÃO</span><span class="ppVal" id="pL">-</span></div></div><div class="ppTabs"><button id="pTH" class="on">HISTÓRICO</button><button id="pTC">TEMPO REAL</button></div><div class="ppAct"><button id="pClear">LIMPAR HISTÓRICO</button><button id="pLogs">LIMPAR CONSOLE</button><button id="pClose">FECHAR</button></div><div class="ppArea" id="pArea"></div><div class="ppFoot">Criado por Daniel Alexandre</div></div>`;document.body.appendChild(p);p.querySelector('#pTH').onclick=()=>{p.dataset.tab='h';p.querySelector('#pTH').classList.add('on');p.querySelector('#pTC').classList.remove('on');render()};p.querySelector('#pTC').onclick=()=>{p.dataset.tab='c';p.querySelector('#pTC').classList.add('on');p.querySelector('#pTH').classList.remove('on');render()};p.querySelector('#pClear').onclick=()=>{if(confirm('Limpar histórico?')){localStorage.removeItem(SH);render()}};p.querySelector('#pLogs').onclick=()=>{logs=[];render()};p.querySelector('#pClose').onclick=()=>{p.remove();clearInterval(matrixTimer)};p.dataset.tab='h';render();matrix()}
+function render(){const p=document.querySelector('#ppPanel');if(!p)return;const h=lerHist();p.querySelector('#pA').textContent=apt||'NENHUMA';p.querySelector('#pF').textContent=aguardando()?'AGUARDANDO ENTREGA':'IGNORANDO OUTRO FILTRO';p.querySelector('#pX').textContent=x===null?'-':x;p.querySelector('#pR').textContent=h.length;p.querySelector('#pL').textContent=logs[0]?`${logs[0].t}: ${logs[0].m}`:'SISTEMA INICIADO';const a=p.querySelector('#pArea');if(p.dataset.tab==='c'){a.innerHTML=logs.length?logs.map(l=>`<div class="ppItem"><div class="ppApt">${esc(l.t)}</div><div class="ppMeta">${esc(l.h)} · ${esc(l.m)}</div></div>`).join(''):'<div class="ppEmpty">SEM EVENTOS</div>';return}a.innerHTML=h.length?h.map((v,i)=>`<div class="ppItem"><div class="ppApt">${esc(v.unidade)}</div><div class="ppMeta">${v.quantidade} encomenda(s) sem baixa · ${esc(v.atualizadoEm)}</div><button data-det="${i}">VER DETALHES</button><div id="d${i}" style="display:none;font-size:10px;margin-top:8px">${(v.detalhes||[]).length?v.detalhes.map((d,j)=>`<div><b>Encomenda ${j+1}</b><br>Número: ${esc(d.numero||'-')}<br>Destinatário: ${esc(d.destinatario||'-')}<br>Status: ${esc(d.status||'-')}<br>Data: ${esc(d.data||'-')}</div>${j<v.detalhes.length-1?'<hr>':''}`).join(''):'Detalhes ainda não carregados.'}</div></div>`).join(''):'<div class="ppEmpty">SEM REGISTROS</div>';a.querySelectorAll('[data-det]').forEach(b=>b.onclick=()=>{const d=a.querySelector(`#d${b.dataset.det}`),o=d.style.display!=='block';d.style.display=o?'block':'none';b.textContent=o?'OCULTAR DETALHES':'VER DETALHES'})}
+function matrix(){const c=document.querySelector('#ppCanvas'),p=document.querySelector('#ppPanel');if(!c||!p)return;c.width=p.offsetWidth;c.height=p.offsetHeight;const z=c.getContext('2d'),chars='01ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%&@',fs=14,d=Array(Math.floor(c.width/fs)).fill(0).map(()=>Math.random()*40);clearInterval(matrixTimer);matrixTimer=setInterval(()=>{if(!document.body.contains(c)){clearInterval(matrixTimer);return}z.fillStyle='rgba(0,0,0,.12)';z.fillRect(0,0,c.width,c.height);z.fillStyle='#22c55e';z.font=`${fs}px monospace`;d.forEach((y,i)=>{z.fillText(chars[Math.floor(Math.random()*chars.length)],i*fs,y*fs);if(y*fs>c.height&&Math.random()>.975)d[i]=0;d[i]++})},90)}
+new MutationObserver(botao).observe(document.documentElement,{childList:true,subtree:true});css();botao();sync();
 })();
