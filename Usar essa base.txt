@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Monitor v505
+// @name         Monitor v505 - Base corrigida
 // @namespace    http://tampermonkey.net/
-// @version      505.0
-// @description  Monitor v504 com confirmação final e abandono corrigidos
+// @version      505.1
+// @description  Monitora somente Aguardando entrega, pausa em Todos/Entregues e registra apenas em saídas reais
 // @author       Daniel Alexandre
 // @match        https://app.econdos.com.br/*
 // @run-at       document-start
@@ -10,2698 +10,482 @@
 // ==/UserScript==
 
 (function () {
-
     "use strict";
 
+    const STORAGE_HISTORICO = "monitor503_historico";
+    const INTERVALO = 300;
 
-    // ==========================================================
-    // CONFIGURAÇÕES
-    // ==========================================================
+    let unidadeAtual = "";
+    let quantidadeAtual = 0;
+    let sessaoAtiva = false;
+    let filtroValido = false;
+    let ultimaURL = location.href;
+    let saidaProcessada = false;
+    let logsSistema = [];
+    let intervaloMatrix = null;
 
-    const STORAGE_ATUAL =
-        "monitor503_atual";
-
-    const STORAGE_HISTORICO =
-        "monitor503_historico";
-
-    const STORAGE_FLUXO =
-        "monitor505_fluxo";
-
-
-    // ==========================================================
-    // VARIÁVEIS
-    // ==========================================================
-
-    let encomendaAtual =
-        localStorage.getItem(STORAGE_ATUAL) || "";
-
-    let ultimoValor =
-        encomendaAtual || "";
-
-    let ultimaURL =
-        location.href;
-
-    let logsSistema =
-        [];
-
-    let intervaloMatrix =
-        null;
-
-    let baixaIniciada =
-        sessionStorage.getItem(STORAGE_FLUXO) === "1";
-
-    let baixaConfirmada =
-        false;
-
-    let processandoSaida =
-        false;
-
-
-    // ==========================================================
-    // UTILITÁRIOS
-    // ==========================================================
+    function normalizarTexto(valor) {
+        return String(valor || "")
+            .trim()
+            .toLowerCase()
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "");
+    }
 
     function escaparHTML(valor) {
-
         return String(valor ?? "")
             .replaceAll("&", "&amp;")
             .replaceAll("<", "&lt;")
             .replaceAll(">", "&gt;")
             .replaceAll('"', "&quot;")
             .replaceAll("'", "&#039;");
-
     }
 
-
-    function normalizarTexto(valor) {
-
-        return String(valor || "")
-            .trim()
-            .toLowerCase()
-            .normalize("NFD")
-            .replace(/[\u0300-\u036f]/g, "");
-
-    }
-
-
-    function registrarEvento(
-        tipo,
-        mensagem,
-        destaque = ""
-    ) {
-
-        const agora =
-            new Date();
-
+    function registrarEvento(tipo, mensagem, destaque = "") {
         logsSistema.unshift({
-
             tipo,
             mensagem,
             destaque,
-
-            hora:
-                agora.toLocaleTimeString("pt-BR")
-
+            hora: new Date().toLocaleTimeString("pt-BR")
         });
-
-        logsSistema =
-            logsSistema.slice(0, 100);
-
-        console.log(
-            `[MONITOR v505] ${tipo}:`,
-            mensagem,
-            destaque
-        );
-
-        atualizarPainel505();
-
+        logsSistema = logsSistema.slice(0, 100);
+        atualizarPainel();
     }
-
-
-    // ==========================================================
-    // HISTÓRICO
-    // ==========================================================
 
     function obterHistorico() {
-
         try {
-
-            const lista =
-                JSON.parse(
-                    localStorage.getItem(
-                        STORAGE_HISTORICO
-                    ) || "[]"
-                );
-
-            return Array.isArray(lista)
-                ? lista
-                : [];
-
-        } catch (erro) {
-
-            console.error(
-                "Erro ao ler histórico:",
-                erro
+            const lista = JSON.parse(
+                localStorage.getItem(STORAGE_HISTORICO) || "[]"
             );
-
+            return Array.isArray(lista) ? lista : [];
+        } catch {
             return [];
-
         }
-
     }
 
-
-    function salvarHistorico(
-        codigo,
-        motivo = "Possível abandono"
-    ) {
-
-        codigo =
-            String(codigo || "").trim();
-
-        if (!codigo)
-            return;
-
-        let lista =
-            obterHistorico();
-
-        const agora =
-            new Date();
-
-        const ultimo =
-            lista[0];
-
-        /*
-         * Evita salvar o mesmo código duas vezes
-         * em poucos segundos.
-         */
-
-        if (
-            ultimo &&
-            ultimo.codigo === codigo &&
-            ultimo.timestamp &&
-            Date.now() -
-            Number(ultimo.timestamp) < 3000
-        ) {
-
-            return;
-
-        }
-
-        lista.unshift({
-
-            codigo,
-
-            data:
-                agora.toLocaleDateString("pt-BR"),
-
-            hora:
-                agora.toLocaleTimeString("pt-BR"),
-
-            dataCompleta:
-                agora.toLocaleString("pt-BR"),
-
-            timestamp:
-                Date.now(),
-
-            motivo
-
-        });
-
-        lista =
-            lista.slice(0, 1000);
-
+    function gravarHistorico(lista) {
         localStorage.setItem(
             STORAGE_HISTORICO,
-            JSON.stringify(lista)
+            JSON.stringify(lista.slice(0, 1000))
         );
-
-        registrarEvento(
-            "HISTÓRICO",
-            motivo,
-            codigo
-        );
-
     }
 
+    function modoFiltro() {
+        const botao = Array.from(
+            document.querySelectorAll(
+                'button[data-testid="delivery-status-filter-button"]'
+            )
+        ).find(el => el.offsetParent !== null);
 
-    // ==========================================================
-    // ENCOMENDA ATUAL
-    // ==========================================================
+        if (!botao) return "outro";
 
-    function salvarAtual(valor) {
-
-        valor =
-            String(valor || "").trim();
-
-        if (!valor)
-            return;
-
-        if (!/^\d+\/\d+$/.test(valor))
-            return;
-
-        if (valor === ultimoValor)
-            return;
-
-        ultimoValor =
-            valor;
-
-        encomendaAtual =
-            valor;
-
-        baixaIniciada =
-            false;
-
-        baixaConfirmada =
-            false;
-
-        processandoSaida =
-            false;
-
-        sessionStorage.removeItem(
-            STORAGE_FLUXO
+        const texto = normalizarTexto(
+            botao.innerText ||
+            botao.textContent ||
+            botao.getAttribute("aria-label") ||
+            botao.getAttribute("title") ||
+            ""
         );
 
-        localStorage.setItem(
-            STORAGE_ATUAL,
-            valor
-        );
-
-        registrarEvento(
-            "CAPTURA",
-            "Encomenda identificada",
-            valor
-        );
-
+        if (texto.includes("aguardando") && texto.includes("entrega")) {
+            return "aguardando";
+        }
+        if (texto.includes("todos") || texto === "todas") return "todos";
+        if (texto.includes("entregue")) return "entregues";
+        return "outro";
     }
 
+    function lerUnidadeSelecionada() {
+        const campo = Array.from(
+            document.querySelectorAll(
+                'input[data-testid="residence-autocomplete-input-search"]'
+            )
+        ).find(el => el.offsetParent !== null);
 
-    function limparAtual(
-        motivo = "",
-        registrar = true
-    ) {
+        if (!campo) return "";
 
-        const codigoAnterior =
-            encomendaAtual;
+        const valor = String(campo.value || "").trim();
+        return /^\d+\/\d+$/.test(valor) ? valor : "";
+    }
 
-        encomendaAtual =
-            "";
+    function lerX() {
+        const tabela = Array.from(
+            document.querySelectorAll('[data-testid="delivery-table"]')
+        ).find(el => el.offsetParent !== null);
 
-        ultimoValor =
-            "";
+        if (!tabela) return null;
 
-        localStorage.removeItem(
-            STORAGE_ATUAL
-        );
+        for (const elemento of tabela.querySelectorAll("footer small")) {
+            if (elemento.offsetParent === null) continue;
 
-        if (
-            registrar &&
-            codigoAnterior
-        ) {
-
-            registrarEvento(
-                "LIMPEZA",
-                motivo ||
-                "Encomenda atual removida",
-                codigoAnterior
+            const match = normalizarTexto(elemento.textContent).match(
+                /(?:^|\s)(\d+)\s+encomenda(?:\(s\)|s)?(?:\s|$)/
             );
 
+            if (match) return Number(match[1]);
         }
 
-        atualizarPainel505();
-
+        return null;
     }
 
+    function salvarPendencia(motivo) {
+        if (saidaProcessada) return false;
+        if (!sessaoAtiva) return false;
+        if (!filtroValido) return false;
+        if (!unidadeAtual) return false;
+        if (quantidadeAtual <= 0) return false;
 
-    // ==========================================================
-    // FLUXO DA BAIXA
-    // ==========================================================
+        saidaProcessada = true;
 
-    function iniciarBaixa() {
+        const texto = quantidadeAtual === 1
+            ? "1 encomenda sem baixa"
+            : `${quantidadeAtual} encomendas sem baixa`;
 
-        baixaIniciada =
-            true;
-
-        baixaConfirmada =
-            false;
-
-        processandoSaida =
-            false;
-
-        sessionStorage.setItem(
-            STORAGE_FLUXO,
-            "1"
+        const historico = obterHistorico().filter(item =>
+            (item.codigo || item.apartamento) !== unidadeAtual
         );
 
+        historico.unshift({
+            codigo: unidadeAtual,
+            apartamento: unidadeAtual,
+            quantidade: quantidadeAtual,
+            motivo: `${texto} · ${motivo}`,
+            dataCompleta: new Date().toLocaleString("pt-BR"),
+            timestamp: Date.now()
+        });
+
+        gravarHistorico(historico);
+        registrarEvento("HISTÓRICO", `${texto} · ${motivo}`, unidadeAtual);
+        return true;
+    }
+
+    function removerDoHistorico(unidade) {
+        if (!unidade) return false;
+
+        const historico = obterHistorico();
+        const novo = historico.filter(item =>
+            (item.codigo || item.apartamento) !== unidade
+        );
+
+        if (novo.length === historico.length) return false;
+
+        gravarHistorico(novo);
         registrarEvento(
             "BAIXA",
-            "Encerramento iniciado",
-            encomendaAtual ||
-            "SEM CÓDIGO"
+            "X chegou a 0. Unidade removida automaticamente do histórico.",
+            unidade
         );
-
+        return true;
     }
 
-
-    function concluirBaixa() {
-
-        const codigo =
-            encomendaAtual;
-
-        /*
-         * O clique no botão SIM é a única
-         * confirmação final válida.
-         */
-
-        baixaConfirmada =
-            true;
-
-        baixaIniciada =
-            false;
-
-        processandoSaida =
-            true;
-
-        sessionStorage.removeItem(
-            STORAGE_FLUXO
-        );
-
-        /*
-         * Limpa antes que o e-Condos mude
-         * de rota ou atualize a tela.
-         */
-
-        limparAtual(
-            "",
-            false
-        );
-
-        registrarEvento(
-            "BAIXA CONCLUÍDA",
-            "Clique final em Sim confirmado. Não enviado ao histórico.",
-            codigo
-        );
-
+    function limparSessao() {
+        unidadeAtual = "";
+        quantidadeAtual = 0;
+        sessaoAtiva = false;
+        filtroValido = false;
+        saidaProcessada = false;
+        atualizarPainel();
     }
 
-
-    function registrarAbandono(motivo) {
-
-        if (!encomendaAtual)
+    function sincronizar() {
+        // Saída real: registra antes de apagar o estado.
+        if (location.href !== ultimaURL) {
+            salvarPendencia("Saiu da página de encomendas");
+            ultimaURL = location.href;
+            limparSessao();
             return;
-
-        if (baixaConfirmada)
-            return;
-
-        if (processandoSaida)
-            return;
-
-        processandoSaida =
-            true;
-
-        const codigo =
-            encomendaAtual;
-
-        salvarHistorico(
-            codigo,
-            motivo
-        );
-
-        baixaIniciada =
-            false;
-
-        sessionStorage.removeItem(
-            STORAGE_FLUXO
-        );
-
-        limparAtual(
-            "",
-            false
-        );
-
-        registrarEvento(
-            "ABANDONO",
-            motivo,
-            codigo
-        );
-
-    }// ==========================================================
-    // CAPTURA DO CAMPO
-    // ==========================================================
-
-    function procurarEncomenda() {
-
-        const campos =
-            document.querySelectorAll("input");
-
-        campos.forEach(campo => {
-
-            if (campo.offsetParent === null)
-                return;
-
-            const valor =
-                String(
-                    campo.value || ""
-                ).trim();
-
-            if (/^\d+\/\d+$/.test(valor)) {
-
-                salvarAtual(valor);
-
-            }
-
-        });
-
-    }
-
-
-    document.addEventListener(
-        "input",
-        evento => {
-
-            const campo =
-                evento.target;
-
-            if (
-                !(campo instanceof HTMLInputElement)
-            ) {
-
-                return;
-
-            }
-
-            const valor =
-                String(
-                    campo.value || ""
-                ).trim();
-
-            if (/^\d+\/\d+$/.test(valor)) {
-
-                salvarAtual(valor);
-
-            }
-
-        },
-        true
-    );
-
-
-    document.addEventListener(
-        "change",
-        evento => {
-
-            const campo =
-                evento.target;
-
-            if (
-                !(campo instanceof HTMLInputElement)
-            ) {
-
-                return;
-
-            }
-
-            const valor =
-                String(
-                    campo.value || ""
-                ).trim();
-
-            if (/^\d+\/\d+$/.test(valor)) {
-
-                salvarAtual(valor);
-
-            }
-
-        },
-        true
-    );
-
-
-    const observadorCampo =
-        new MutationObserver(() => {
-
-            procurarEncomenda();
-            criarBotaoMonitor();
-
-        });
-
-
-    observadorCampo.observe(
-        document.documentElement,
-        {
-            childList: true,
-            subtree: true
         }
-    );
 
+        const modo = modoFiltro();
 
-    setInterval(() => {
+        // Todos e Entregues apenas pausam. Não leem X e não apagam a sessão.
+        if (modo === "todos" || modo === "entregues") {
+            atualizarPainel();
+            return;
+        }
 
-        procurarEncomenda();
+        // O React pode desmontar o filtro durante a navegação.
+        // Não apaga a memória; URL/lixeira/fechamento decidem a saída.
+        if (modo === "outro") {
+            atualizarPainel();
+            return;
+        }
 
-    }, 500);
+        filtroValido = true;
 
+        const unidade = lerUnidadeSelecionada();
 
-    // ==========================================================
-    // IDENTIFICAÇÃO DOS BOTÕES
-    // ==========================================================
+        if (!unidade) {
+            if (sessaoAtiva && quantidadeAtual > 0) {
+                salvarPendencia("Campo apagado antes de concluir a baixa");
+            }
+            limparSessao();
+            return;
+        }
 
-    function eBotaoEncerrar(botao) {
-
-        return (
-            botao.getAttribute(
-                "data-testid"
-            ) ===
-            "delivery-close-button"
-        );
-
-    }
-
-
-    function eBotaoSimFinal(botao) {
+        const x = lerX();
+        if (x === null) return;
 
         if (
-            !botao.classList.contains(
-                "swal2-confirm"
-            )
+            sessaoAtiva &&
+            unidadeAtual &&
+            unidade !== unidadeAtual &&
+            quantidadeAtual > 0
         ) {
-
-            return false;
-
+            salvarPendencia(
+                "Outra residência foi pesquisada antes de concluir a baixa"
+            );
+            limparSessao();
+            filtroValido = true;
         }
+
+        unidadeAtual = unidade;
+        quantidadeAtual = x;
+        saidaProcessada = false;
+
+        if (x === 0) {
+            sessaoAtiva = false;
+            removerDoHistorico(unidade);
+            atualizarPainel();
+            return;
+        }
+
+        sessaoAtiva = true;
+        atualizarPainel();
+    }
+
+    document.addEventListener("click", evento => {
+        const botao = evento.target.closest("button");
+        if (!botao) return;
 
         if (
-            !botao.classList.contains(
-                "swal2-styled"
-            )
+            botao.getAttribute("data-testid") ===
+            "residence-autocomplete-clear-input-button"
         ) {
-
-            return false;
-
+            salvarPendencia("Campo apagado antes de concluir a baixa");
+            limparSessao();
         }
-
-        return normalizarTexto(
-            botao.textContent
-        ) === "sim";
-
-    }
-
-
-    function eBotaoCancelar(botao) {
-
-        return (
-            botao.classList.contains(
-                "swal2-cancel"
-            ) ||
-            botao.classList.contains(
-                "swal2-close"
-            )
-        );
-
-    }
-
-
-    function eBotaoDoMonitor(botao) {
-
-        return Boolean(
-            botao.id ===
-                "botaoMonitor505"
-            ||
-            botao.closest(
-                "#painelConsultas505"
-            )
-        );
-
-    }
-
-
-    function pareceBotaoLixeira(botao) {
-
-        if (!botao)
-            return false;
-
-        if (eBotaoDoMonitor(botao))
-            return false;
-
-        if (eBotaoEncerrar(botao))
-            return false;
-
-        if (eBotaoSimFinal(botao))
-            return false;
-
-        if (eBotaoCancelar(botao))
-            return false;
-
-
-        /*
-         * Durante o fluxo da baixa,
-         * nenhum botão genérico com SVG
-         * será tratado como lixeira.
-         */
-
-        if (baixaIniciada)
-            return false;
-
-
-        const testId =
-            normalizarTexto(
-                botao.getAttribute(
-                    "data-testid"
-                )
-            );
-
-        const ariaLabel =
-            normalizarTexto(
-                botao.getAttribute(
-                    "aria-label"
-                )
-            );
-
-        const titulo =
-            normalizarTexto(
-                botao.getAttribute(
-                    "title"
-                )
-            );
-
-        const texto =
-            normalizarTexto(
-                botao.textContent
-            );
-
-
-        const termos = [
-
-            "delete",
-            "remove",
-            "clear",
-            "excluir",
-            "remover",
-            "limpar",
-            "lixeira"
-
-        ];
-
-
-        const identificadoPorNome =
-            termos.some(termo => {
-
-                return (
-                    testId.includes(termo)
-                    ||
-                    ariaLabel.includes(termo)
-                    ||
-                    titulo.includes(termo)
-                    ||
-                    texto === termo
-                );
-
-            });
-
-
-        if (identificadoPorNome)
-            return true;
-
-
-        const svg =
-            botao.querySelector("svg");
-
-        if (!svg)
-            return false;
-
-
-        const html =
-            svg.outerHTML.toLowerCase();
-
-
-        return (
-            html.includes("currentcolor")
-            &&
-            html.includes("<path")
-        );
-
-    }
-
-
-    // ==========================================================
-    // CONTROLE DOS CLIQUES
-    // ==========================================================
-
-    document.addEventListener(
-        "click",
-        evento => {
-
-            const botao =
-                evento.target.closest("button");
-
-            if (!botao)
-                return;
-
-            if (eBotaoDoMonitor(botao))
-                return;
-
-
-            // --------------------------------------------------
-            // PASSO 3 — CLIQUE FINAL EM SIM
-            // --------------------------------------------------
-
-            if (eBotaoSimFinal(botao)) {
-
-                if (
-                    encomendaAtual &&
-                    baixaIniciada
-                ) {
-
-                    concluirBaixa();
-
-                } else {
-
-                    registrarEvento(
-                        "AVISO",
-                        "Botão Sim detectado fora do fluxo monitorado"
-                    );
-
-                }
-
-                return;
-
-            }
-
-
-            // --------------------------------------------------
-            // PASSO 1 — BOTÃO ENCERRAR
-            // --------------------------------------------------
-
-            if (eBotaoEncerrar(botao)) {
-
-                iniciarBaixa();
-
-                return;
-
-            }
-
-
-            // --------------------------------------------------
-            // CANCELAMENTO DA CONFIRMAÇÃO
-            // --------------------------------------------------
-
-            if (eBotaoCancelar(botao)) {
-
-                if (baixaIniciada) {
-
-                    registrarEvento(
-                        "BAIXA",
-                        "Confirmação final cancelada",
-                        encomendaAtual
-                    );
-
-                    baixaIniciada =
-                        false;
-
-                    sessionStorage.removeItem(
-                        STORAGE_FLUXO
-                    );
-
-                }
-
-                return;
-
-            }
-
-
-            // --------------------------------------------------
-            // LIXEIRA / LIMPEZA DO CAMPO
-            // --------------------------------------------------
-
-            if (pareceBotaoLixeira(botao)) {
-
-                if (encomendaAtual) {
-
-                    registrarAbandono(
-                        "Campo limpo sem confirmação final"
-                    );
-
-                } else {
-
-                    registrarEvento(
-                        "AÇÃO",
-                        "Botão de limpeza detectado sem encomenda ativa"
-                    );
-
-                }
-
-            }
-
-        },
-        true
-    );
-
-
-    // ==========================================================
-    // TROCA DE PÁGINA
-    // ==========================================================
-
-    setInterval(() => {
-
-        if (location.href === ultimaURL)
-            return;
-
-
-        const urlAnterior =
-            ultimaURL;
-
-        ultimaURL =
-            location.href;
-
-
-        registrarEvento(
-            "NAVEGAÇÃO",
-            "Mudança de página detectada",
-            `${urlAnterior} → ${ultimaURL}`
-        );
-
-
-        /*
-         * Se já confirmou no botão Sim,
-         * a mudança de página é normal.
-         */
-
-        if (baixaConfirmada)
-            return;
-
-
-        /*
-         * Se ainda existe encomenda ativa,
-         * qualquer saída sem confirmação final
-         * será registrada.
-         */
-
-        if (encomendaAtual) {
-
-            registrarAbandono(
-
-                baixaIniciada
-
-                    ? "Saiu da página antes de confirmar o passo final"
-
-                    : "Página abandonada sem concluir a baixa"
-
-            );
-
-        }
-
-    }, 500);
-
-
-    // ==========================================================
-    // FECHAR, RECARREGAR OU SAIR DO SISTEMA
-    // ==========================================================
+    }, true);
 
     function processarFechamento() {
-
-        if (!encomendaAtual)
-            return;
-
-        if (baixaConfirmada)
-            return;
-
-        if (processandoSaida)
-            return;
-
-
-        const codigo =
-            encomendaAtual;
-
-        const motivo =
-            baixaIniciada
-
-                ? "Sistema fechado ou atualizado antes do clique final em Sim"
-
-                : "Sistema fechado ou atualizado sem concluir a baixa";
-
-
-        let lista =
-            obterHistorico();
-
-        const agora =
-            new Date();
-
-
-        lista.unshift({
-
-            codigo,
-
-            data:
-                agora.toLocaleDateString("pt-BR"),
-
-            hora:
-                agora.toLocaleTimeString("pt-BR"),
-
-            dataCompleta:
-                agora.toLocaleString("pt-BR"),
-
-            timestamp:
-                Date.now(),
-
-            motivo
-
-        });
-
-
-        lista =
-            lista.slice(0, 1000);
-
-
-        localStorage.setItem(
-            STORAGE_HISTORICO,
-            JSON.stringify(lista)
-        );
-
-
-        localStorage.removeItem(
-            STORAGE_ATUAL
-        );
-
-
-        sessionStorage.removeItem(
-            STORAGE_FLUXO
-        );
-
-
-        processandoSaida =
-            true;
-
+        salvarPendencia("Página fechada ou atualizada");
     }
 
-
-    window.addEventListener(
-        "beforeunload",
-        processarFechamento,
-        {
-            capture: true
-        }
-    );
-
-
-    window.addEventListener(
-        "pagehide",
-        processarFechamento,
-        {
-            capture: true
-        }
-    );// ==========================================================
-    // CSS PREMIUM
-    // ==========================================================
-
-    function adicionarEstiloPainel() {
-
-        if (
-            document.querySelector(
-                "#cssMonitor505"
-            )
-        ) {
-
-            return;
-
-        }
-
-        const style =
-            document.createElement("style");
-
-        style.id =
-            "cssMonitor505";
-
-        style.innerHTML = `
-
-            #painelConsultas505,
-            #painelConsultas505 * {
-                box-sizing: border-box;
-                font-family: Arial, Helvetica, sans-serif;
-            }
-
-            #painelConsultas505 {
-                animation:
-                    abrirPainel505 .25s ease-out;
-            }
-
-            @keyframes abrirPainel505 {
-
-                from {
-                    opacity: 0;
-                    transform:
-                        translateY(-10px)
-                        scale(.98);
-                }
-
-                to {
-                    opacity: 1;
-                    transform:
-                        translateY(0)
-                        scale(1);
-                }
-
-            }
-
-            @keyframes piscarLed505 {
-
-                50% {
-                    opacity: .3;
-                    transform: scale(.8);
-                }
-
-            }
-
-            .conteudoPainel505 {
-                position: relative;
-                z-index: 2;
-                padding: 18px;
-                height: 100%;
-                display: flex;
-                flex-direction: column;
-            }
-
-            .topoPainel505 {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                flex-shrink: 0;
-            }
-
-            .tituloPainel505 {
-                font-size: 18px;
-                font-weight: bold;
-                color: #22c55e;
-                letter-spacing: 1px;
-                text-shadow:
-                    0 0 15px
-                    rgba(34,197,94,.9);
-            }
-
-            .subtituloPainel505 {
-                font-size: 10px;
-                color: #777;
-                margin-top: 5px;
-                letter-spacing: 2px;
-            }
-
-            .ledSistema505 {
-                width: 13px;
-                height: 13px;
-                border-radius: 50%;
-                background: #22c55e;
-                box-shadow:
-                    0 0 18px #22c55e;
-                animation:
-                    piscarLed505 1.3s infinite;
-            }
-
-            .statusBox505 {
-                margin-top: 15px;
-                padding: 12px;
-                border-radius: 12px;
-                background:
-                    rgba(0,0,0,.72);
-                border:
-                    1px solid
-                    rgba(34,197,94,.25);
-                font-size: 12px;
-                color: #aaa;
-                line-height: 20px;
-                flex-shrink: 0;
-            }
-
-            .statusLinha505 {
-                display: flex;
-                align-items: flex-start;
-                justify-content: space-between;
-                gap: 10px;
-            }
-
-            .statusValor505 {
-                color: #22c55e;
-                font-weight: bold;
-                text-align: right;
-                overflow-wrap: anywhere;
-                max-width: 230px;
-            }
-
-            .abasPainel505 {
-                display: flex;
-                gap: 8px;
-                margin-top: 12px;
-                flex-shrink: 0;
-            }
-
-            .abaPainel505 {
-                flex: 1;
-                border:
-                    1px solid
-                    rgba(34,197,94,.25);
-                background:
-                    rgba(17,24,39,.75);
-                color: #888;
-                border-radius: 9px;
-                padding: 8px 5px;
-                cursor: pointer;
-                font-size: 11px;
-                font-weight: bold;
-                transition: .2s;
-            }
-
-            .abaPainel505:hover,
-            .abaPainel505.ativa505 {
-                color: #22c55e;
-                border-color: #22c55e;
-                background:
-                    rgba(34,197,94,.10);
-            }
-
-            .acoesPainel505 {
-                display: flex;
-                gap: 8px;
-                margin-top: 10px;
-                flex-shrink: 0;
-            }
-
-            .acoesPainel505 button {
-                flex: 1;
-                padding: 8px 5px;
-                border-radius: 9px;
-                font-weight: bold;
-                cursor: pointer;
-                font-size: 10px;
-                transition: .2s;
-            }
-
-            #limparHistorico505 {
-                background:
-                    rgba(239,68,68,.12);
-                border:
-                    1px solid #ef4444;
-                color: #ef4444;
-            }
-
-            #limparHistorico505:hover {
-                background: #ef4444;
-                color: #fff;
-            }
-
-            #limparConsole505 {
-                background:
-                    rgba(59,130,246,.12);
-                border:
-                    1px solid #3b82f6;
-                color: #60a5fa;
-            }
-
-            #limparConsole505:hover {
-                background: #3b82f6;
-                color: #fff;
-            }
-
-            #fecharPainel505 {
-                background:
-                    rgba(34,197,94,.12);
-                border:
-                    1px solid #22c55e;
-                color: #22c55e;
-            }
-
-            #fecharPainel505:hover {
-                background: #22c55e;
-                color: #000;
-            }
-
-            .areaConteudo505 {
-                position: relative;
-                flex: 1;
-                min-height: 0;
-                margin-top: 12px;
-            }
-
-            .listaSistema505,
-            .consoleSistema505 {
-                height: 100%;
-                overflow-y: auto;
-                padding-right: 5px;
-            }
-
-            .listaSistema505::-webkit-scrollbar,
-            .consoleSistema505::-webkit-scrollbar {
-                width: 5px;
-            }
-
-            .listaSistema505::-webkit-scrollbar-thumb,
-            .consoleSistema505::-webkit-scrollbar-thumb {
-                background: #22c55e;
-                border-radius: 10px;
-            }
-
-            .registroSistema505 {
-                background:
-                    rgba(17,24,39,.88);
-                border:
-                    1px solid
-                    rgba(34,197,94,.20);
-                padding: 12px;
-                border-radius: 12px;
-                margin-bottom: 9px;
-                transition: .2s;
-            }
-
-            .registroSistema505:hover {
-                border-color: #22c55e;
-                box-shadow:
-                    0 0 15px
-                    rgba(34,197,94,.20);
-            }
-
-            .codigoSistema505 {
-                font-size: 18px;
-                font-weight: bold;
-                color: #22c55e;
-            }
-
-            .dataSistema505 {
-                margin-top: 5px;
-                font-size: 11px;
-                color: #888;
-            }
-
-            .motivoSistema505 {
-                margin-top: 5px;
-                font-size: 10px;
-                color: #fbbf24;
-                line-height: 15px;
-            }
-
-            .eventoConsole505 {
-                background:
-                    rgba(0,0,0,.78);
-                border-left:
-                    3px solid #22c55e;
-                padding: 9px 10px;
-                margin-bottom: 7px;
-                border-radius: 5px;
-                font-family: monospace;
-            }
-
-            .eventoTopo505 {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                gap: 8px;
-            }
-
-            .eventoTipo505 {
-                color: #22c55e;
-                font-size: 10px;
-                font-weight: bold;
-            }
-
-            .eventoHora505 {
-                color: #555;
-                font-size: 9px;
-            }
-
-            .eventoMensagem505 {
-                color: #aaa;
-                font-size: 11px;
-                margin-top: 5px;
-                line-height: 15px;
-            }
-
-            .eventoDestaque505 {
-                color: #fff;
-                font-weight: bold;
-                overflow-wrap: anywhere;
-            }
-
-            .vazioSistema505 {
-                text-align: center;
-                margin-top: 80px;
-                color: #555;
-                font-size: 12px;
-                letter-spacing: 2px;
-            }
-
-            .rodapePainel505 {
-                text-align: center;
-                font-size: 9px;
-                color: #444;
-                padding-top: 8px;
-                flex-shrink: 0;
-            }
-
-            #tooltipMonitor505 {
-                display: none;
-                position: fixed;
-                width: 320px;
-                padding: 15px;
-                background: #050505;
-                border:
-                    1px solid #22c55e;
-                border-radius: 12px;
-                z-index: 2147483647;
-                box-shadow:
-                    0 0 30px
-                    rgba(34,197,94,.35);
-                color: #fff;
-                font-family:
-                    Arial,
-                    Helvetica,
-                    sans-serif;
-            }
-
-            .tooltipTitulo505 {
-                color: #22c55e;
-                font-weight: bold;
-                font-size: 14px;
-                margin-bottom: 10px;
-            }
-
-            .tooltipTexto505 {
-                font-size: 12px;
-                color: #aaa;
-                line-height: 18px;
-            }
-
-            .tooltipAutor505 {
-                margin-top: 10px;
-                text-align: right;
-                color: #22c55e;
-                font-size: 11px;
-            }
-
-            #botaoMonitor505 {
-                display: inline-flex !important;
-                align-items: center;
-                justify-content: center;
-                gap: 8px;
-                white-space: nowrap;
-                margin-left: 10px !important;
-            }
-
-            .ledBotao505 {
-                width: 8px;
-                height: 8px;
-                flex-shrink: 0;
-                border-radius: 50%;
-                background: #22c55e;
-                box-shadow:
-                    0 0 12px #22c55e;
-                animation:
-                    piscarLed505 1s infinite;
-            }
-
-            @media (max-width: 600px) {
-
-                #painelConsultas505 {
-                    top: 10px !important;
-                    left: 10px !important;
-                    right: 10px !important;
-                    width: auto !important;
-                    height:
-                        calc(100vh - 20px)
-                        !important;
-                }
-
-                #tooltipMonitor505 {
-                    left: 10px !important;
-                    right: 10px !important;
-                    width: auto !important;
-                }
-
-                .tituloPainel505 {
-                    font-size: 15px;
-                }
-
-                .statusValor505 {
-                    max-width: 180px;
-                }
-
-            }
-
+    window.addEventListener("beforeunload", processarFechamento, {
+        capture: true
+    });
+    window.addEventListener("pagehide", processarFechamento, {
+        capture: true
+    });
+
+    function adicionarEstilo() {
+        if (document.querySelector("#cssMonitor505")) return;
+
+        const style = document.createElement("style");
+        style.id = "cssMonitor505";
+        style.textContent = `
+            #painelConsultas505,#painelConsultas505 *{box-sizing:border-box;font-family:Arial,Helvetica,sans-serif}
+            #painelConsultas505{animation:abrir505 .25s ease-out}
+            @keyframes abrir505{from{opacity:0;transform:translateY(-10px) scale(.98)}to{opacity:1;transform:none}}
+            @keyframes led505{50%{opacity:.3;transform:scale(.8)}}
+            .conteudo505{position:relative;z-index:2;padding:18px;height:100%;display:flex;flex-direction:column}
+            .topo505{display:flex;justify-content:space-between;align-items:center}
+            .titulo505{font-size:18px;font-weight:bold;color:#22c55e;letter-spacing:1px;text-shadow:0 0 15px rgba(34,197,94,.9)}
+            .subtitulo505{font-size:10px;color:#777;margin-top:5px;letter-spacing:2px}
+            .led505{width:13px;height:13px;border-radius:50%;background:#22c55e;box-shadow:0 0 18px #22c55e;animation:led505 1.3s infinite}
+            .status505{margin-top:15px;padding:12px;border-radius:12px;background:rgba(0,0,0,.72);border:1px solid rgba(34,197,94,.25);font-size:12px;color:#aaa;line-height:20px}
+            .linha505{display:flex;justify-content:space-between;gap:10px}.valor505{color:#22c55e;font-weight:bold;text-align:right}
+            .acoes505{display:flex;gap:8px;margin-top:10px}.acoes505 button{flex:1;padding:8px;border-radius:9px;font-weight:bold;font-size:10px;cursor:pointer}
+            #limpar505{background:rgba(239,68,68,.12);border:1px solid #ef4444;color:#ef4444}
+            #fechar505{background:rgba(34,197,94,.12);border:1px solid #22c55e;color:#22c55e}
+            .lista505{flex:1;min-height:0;overflow-y:auto;margin-top:12px;padding-right:5px}
+            .registro505{background:rgba(17,24,39,.88);border:1px solid rgba(34,197,94,.2);padding:12px;border-radius:12px;margin-bottom:9px}
+            .codigo505{font-size:18px;font-weight:bold;color:#22c55e}.data505{margin-top:5px;font-size:11px;color:#888}.motivo505{margin-top:5px;font-size:10px;color:#fbbf24;line-height:15px}
+            .vazio505{text-align:center;margin-top:80px;color:#666;font-size:12px;letter-spacing:2px}
+            .rodape505{text-align:center;font-size:9px;color:#555;padding-top:8px}
+            #botaoMonitor505{display:inline-flex!important;align-items:center;justify-content:center;gap:8px;white-space:nowrap;margin-left:10px!important}
+            #tooltipMonitor505{display:none;position:fixed;width:320px;padding:15px;background:#050505;border:1px solid #22c55e;border-radius:12px;z-index:2147483647;box-shadow:0 0 30px rgba(34,197,94,.35);color:#fff}
+            @media(max-width:600px){#painelConsultas505{top:10px!important;left:10px!important;right:10px!important;width:auto!important;height:calc(100vh - 20px)!important}}
         `;
-
-        (
-            document.head ||
-            document.documentElement
-        ).appendChild(style);
-
+        (document.head || document.documentElement).appendChild(style);
     }
 
+    function criarBotao() {
+        adicionarEstilo();
+        if (document.querySelector("#botaoMonitor505")) return;
 
-    // ==========================================================
-    // CRIAR BOTÃO DO MONITOR
-    // ==========================================================
-
-    function criarBotaoMonitor() {
-
-        adicionarEstiloPainel();
-
-        if (
-            document.querySelector(
-                "#botaoMonitor505"
-            )
-        ) {
-
-            return;
-
-        }
-
-        const referencia =
-            document.querySelector(
-                'button[data-testid="delivery-select-multiple-deliveries-button"]'
-            );
-
-        if (!referencia)
-            return;
-
-        const botao =
-            document.createElement("button");
-
-        botao.id =
-            "botaoMonitor505";
-
-        botao.type =
-            "button";
-
-        botao.className =
-            referencia.className;
-
-        botao.innerHTML = `
-
-            MONITOR DE ENCOMENDAS
-
-            <span class="ledBotao505"></span>
-
-        `;
-
-        botao.addEventListener(
-            "click",
-            abrirPainel505
+        const referencia = document.querySelector(
+            'button[data-testid="delivery-select-multiple-deliveries-button"]'
         );
+        if (!referencia) return;
 
-        referencia.insertAdjacentElement(
-            "afterend",
-            botao
-        );
+        const botao = document.createElement("button");
+        botao.id = "botaoMonitor505";
+        botao.type = "button";
+        botao.className = referencia.className;
+        botao.innerHTML = 'MONITOR DE ENCOMENDAS <span class="led505" style="width:8px;height:8px"></span>';
+        botao.onclick = abrirPainel;
+        referencia.insertAdjacentElement("afterend", botao);
 
-        criarTooltip505(
-            botao
-        );
-
-        registrarEvento(
-            "INTERFACE",
-            "Botão do monitor criado"
-        );
-
-    }
-
-
-    // ==========================================================
-    // TOOLTIP
-    // ==========================================================
-
-    function criarTooltip505(botao) {
-
-        const antigo =
-            document.querySelector(
-                "#tooltipMonitor505"
-            );
-
-        if (antigo)
-            antigo.remove();
-
-        const tooltip =
-            document.createElement("div");
-
-        tooltip.id =
-            "tooltipMonitor505";
-
+        const tooltip = document.createElement("div");
+        tooltip.id = "tooltipMonitor505";
         tooltip.innerHTML = `
-
-            <div class="tooltipTitulo505">
-                MONITOR DE ENCOMENDAS
+            <div style="color:#22c55e;font-weight:bold;margin-bottom:10px">MONITOR DE ENCOMENDAS</div>
+            <div style="font-size:12px;color:#aaa;line-height:18px">
+                Monitora somente <b style="color:#22c55e">Aguardando entrega</b>.<br><br>
+                Todos e Entregues apenas pausam a leitura, sem apagar a sessão válida.<br><br>
+                X = 0 remove a unidade do histórico. X maior que 0 só é registrado ao sair, apagar o campo, atualizar ou fechar.
             </div>
+            <div style="margin-top:10px;text-align:right;color:#22c55e;font-size:11px">Criado por Daniel Alexandre</div>`;
+        document.body.appendChild(tooltip);
 
-            <div class="tooltipTexto505">
+        botao.onmouseenter = () => {
+            const p = botao.getBoundingClientRect();
+            tooltip.style.display = "block";
+            tooltip.style.top = `${p.bottom + 8}px`;
+            tooltip.style.left = `${Math.max(10, Math.min(p.left, innerWidth - 330))}px`;
+        };
+        botao.onmouseleave = () => tooltip.style.display = "none";
+    }
 
-                O código digitado é acompanhado
-                até a confirmação final.
-
-                <br><br>
-
-                A encomenda só será considerada
-                baixada depois do clique em
-                <b style="color:#22c55e">
-                    Sim
-                </b>
-                na última confirmação.
-
-                <br><br>
-
-                Caso a página seja fechada,
-                atualizada ou abandonada antes
-                desse clique, o código será
-                enviado ao histórico.
-
-                <br><br>
-
-                Baixas concluídas corretamente
-                não aparecem no histórico.
-
-            </div>
-
-            <div class="tooltipAutor505">
-                Criado por Daniel Alexandre
-            </div>
-
-        `;
-
-        document.body.appendChild(
-            tooltip
-        );
-
-        botao.addEventListener(
-            "mouseenter",
-            () => {
-
-                const posicao =
-                    botao.getBoundingClientRect();
-
-                tooltip.style.display =
-                    "block";
-
-                tooltip.style.top =
-                    `${posicao.bottom + 8}px`;
-
-                let esquerda =
-                    posicao.left;
-
-                if (
-                    esquerda + 320 >
-                    window.innerWidth - 10
-                ) {
-
-                    esquerda =
-                        window.innerWidth - 330;
-
-                }
-
-                tooltip.style.left =
-                    `${Math.max(10, esquerda)}px`;
-
-            }
-        );
-
-        botao.addEventListener(
-            "mouseleave",
-            () => {
-
-                tooltip.style.display =
-                    "none";
-
-            }
-        );
-
-    }// ==========================================================
-    // ABRIR PAINEL
-    // ==========================================================
-
-    function abrirPainel505() {
-
-        adicionarEstiloPainel();
-
-        const painelAntigo =
-            document.querySelector(
-                "#painelConsultas505"
-            );
-
-        if (painelAntigo) {
-
-            painelAntigo.remove();
-
-            if (intervaloMatrix) {
-
-                clearInterval(
-                    intervaloMatrix
-                );
-
-                intervaloMatrix =
-                    null;
-
-            }
-
+    function abrirPainel() {
+        const antigo = document.querySelector("#painelConsultas505");
+        if (antigo) {
+            antigo.remove();
+            if (intervaloMatrix) clearInterval(intervaloMatrix);
+            intervaloMatrix = null;
+            return;
         }
 
-
-        const painel =
-            document.createElement("div");
-
-
-        painel.id =
-            "painelConsultas505";
-
-
-        painel.dataset.aba =
-            "historico";
-
-
-        Object.assign(
-
-            painel.style,
-
-            {
-
-                position:
-                    "fixed",
-
-                top:
-                    "60px",
-
-                right:
-                    "25px",
-
-                width:
-                    "410px",
-
-                height:
-                    "610px",
-
-                background:
-                    "#050505",
-
-                color:
-                    "#fff",
-
-                zIndex:
-                    "2147483646",
-
-                borderRadius:
-                    "18px",
-
-                overflow:
-                    "hidden",
-
-                border:
-                    "1px solid #22c55e",
-
-                boxShadow:
-                    "0 0 35px rgba(34,197,94,.35)"
-
-            }
-
-        );
-
+        adicionarEstilo();
+        const painel = document.createElement("div");
+        painel.id = "painelConsultas505";
+        Object.assign(painel.style, {
+            position: "fixed",
+            top: "60px",
+            right: "25px",
+            width: "410px",
+            height: "610px",
+            background: "#050505",
+            color: "#fff",
+            zIndex: "2147483646",
+            borderRadius: "18px",
+            overflow: "hidden",
+            border: "1px solid #22c55e",
+            boxShadow: "0 0 35px rgba(34,197,94,.35)"
+        });
 
         painel.innerHTML = `
-
-            <canvas
-                id="matrixPainel505"
-                style="
-                    position:absolute;
-                    inset:0;
-                    width:100%;
-                    height:100%;
-                    opacity:.12;
-                    pointer-events:none;
-                "
-            ></canvas>
-
-
-            <div class="conteudoPainel505">
-
-
-                <div class="topoPainel505">
-
-
-                    <div>
-
-
-                        <div class="tituloPainel505">
-
-                            Monitor de encomendas
-
-                        </div>
-
-
-                        <div class="subtituloPainel505">
-
-                            SYSTEM ONLINE · V505
-
-                        </div>
-
-
-                    </div>
-
-
-                    <div class="ledSistema505"></div>
-
-
+            <canvas id="matrix505" style="position:absolute;inset:0;width:100%;height:100%;opacity:.12;pointer-events:none"></canvas>
+            <div class="conteudo505">
+                <div class="topo505"><div><div class="titulo505">MONITOR DE ENCOMENDAS</div><div class="subtitulo505">SYSTEM ONLINE · V505.1</div></div><div class="led505"></div></div>
+                <div class="status505">
+                    <div class="linha505"><span>FILTRO</span><span id="filtro505" class="valor505">AGUARDANDO</span></div>
+                    <div class="linha505"><span>UNIDADE</span><span id="unidade505" class="valor505">NENHUMA</span></div>
+                    <div class="linha505"><span>ETAPA</span><span id="etapa505" class="valor505">AGUARDANDO</span></div>
+                    <div class="linha505"><span>REGISTROS</span><span id="registros505" class="valor505">0</span></div>
+                    <div class="linha505"><span>ÚLTIMA AÇÃO</span><span id="acao505" class="valor505">SISTEMA INICIADO</span></div>
                 </div>
-
-
-                <div class="statusBox505">
-
-
-                    <div class="statusLinha505">
-
-                        <span>
-                            MONITORAMENTO
-                        </span>
-
-                        <span class="statusValor505">
-                            ATIVO
-                        </span>
-
-                    </div>
-
-
-                    <div class="statusLinha505">
-
-                        <span>
-                            ENCOMENDA ATUAL
-                        </span>
-
-                        <span
-                            id="codigoAtual505"
-                            class="statusValor505"
-                        >
-                            NENHUMA
-                        </span>
-
-                    </div>
-
-
-                    <div class="statusLinha505">
-
-                        <span>
-                            ETAPA DA BAIXA
-                        </span>
-
-                        <span
-                            id="etapaBaixa505"
-                            class="statusValor505"
-                        >
-                            AGUARDANDO
-                        </span>
-
-                    </div>
-
-
-                    <div class="statusLinha505">
-
-                        <span>
-                            REGISTROS
-                        </span>
-
-                        <span
-                            id="quantidadeRegistros505"
-                            class="statusValor505"
-                        >
-                            0
-                        </span>
-
-                    </div>
-
-
-                    <div class="statusLinha505">
-
-                        <span>
-                            ÚLTIMA AÇÃO
-                        </span>
-
-                        <span
-                            id="ultimaAcao505"
-                            class="statusValor505"
-                        >
-                            SISTEMA INICIADO
-                        </span>
-
-                    </div>
-
-
-                </div>
-
-
-                <div class="abasPainel505">
-
-
-                    <button
-                        type="button"
-                        id="abaHistorico505"
-                        class="abaPainel505 ativa505"
-                    >
-
-                        HISTÓRICO
-
-                    </button>
-
-
-                    <button
-                        type="button"
-                        id="abaTempoReal505"
-                        class="abaPainel505"
-                    >
-
-                        TEMPO REAL
-
-                    </button>
-
-
-                </div>
-
-
-                <div class="acoesPainel505">
-
-
-                    <button
-                        type="button"
-                        id="limparHistorico505"
-                    >
-
-                        LIMPAR HISTÓRICO
-
-                    </button>
-
-
-                    <button
-                        type="button"
-                        id="limparConsole505"
-                    >
-
-                        LIMPAR CONSOLE
-
-                    </button>
-
-
-                    <button
-                        type="button"
-                        id="fecharPainel505"
-                    >
-
-                        FECHAR
-
-                    </button>
-
-
-                </div>
-
-
-                <div class="areaConteudo505">
-
-
-                    <div
-                        id="listaHistorico505"
-                        class="listaSistema505"
-                    ></div>
-
-
-                    <div
-                        id="consoleTempoReal505"
-                        class="consoleSistema505"
-                        style="display:none"
-                    ></div>
-
-
-                </div>
-
-
-                <div class="rodapePainel505">
-
-                    Criado por Daniel Alexandre
-
-                </div>
-
-
-            </div>
-
-        `;
-
-
-        document.body.appendChild(
-            painel
-        );
-
-
-        configurarEventosPainel505(
-            painel
-        );
-
-
-        atualizarPainel505();
-
-
-        matrixPainel505();
-
-
-        registrarEvento(
-            "INTERFACE",
-            "Painel aberto"
-        );
-
+                <div class="acoes505"><button id="limpar505">LIMPAR HISTÓRICO</button><button id="fechar505">FECHAR</button></div>
+                <div id="lista505" class="lista505"></div>
+                <div class="rodape505">Criado por Daniel Alexandre</div>
+            </div>`;
+
+        document.body.appendChild(painel);
+        painel.querySelector("#fechar505").onclick = () => abrirPainel();
+        painel.querySelector("#limpar505").onclick = () => {
+            if (!confirm("Deseja realmente limpar todo o histórico?")) return;
+            localStorage.removeItem(STORAGE_HISTORICO);
+            atualizarPainel();
+        };
+        atualizarPainel();
+        iniciarMatrix();
     }
 
-
-    // ==========================================================
-    // EVENTOS DO PAINEL
-    // ==========================================================
-
-    function configurarEventosPainel505(
-        painel
-    ) {
-
-        const abaHistorico =
-            painel.querySelector(
-                "#abaHistorico505"
-            );
-
-
-        const abaTempoReal =
-            painel.querySelector(
-                "#abaTempoReal505"
-            );
-
-
-        const listaHistorico =
-            painel.querySelector(
-                "#listaHistorico505"
-            );
-
-
-        const consoleTempoReal =
-            painel.querySelector(
-                "#consoleTempoReal505"
-            );
-
-
-        abaHistorico.onclick = () => {
-
-            painel.dataset.aba =
-                "historico";
-
-
-            abaHistorico.classList.add(
-                "ativa505"
-            );
-
-
-            abaTempoReal.classList.remove(
-                "ativa505"
-            );
-
-
-            listaHistorico.style.display =
-                "block";
-
-
-            consoleTempoReal.style.display =
-                "none";
-
-        };
-
-
-        abaTempoReal.onclick = () => {
-
-            painel.dataset.aba =
-                "tempo-real";
-
-
-            abaTempoReal.classList.add(
-                "ativa505"
-            );
-
-
-            abaHistorico.classList.remove(
-                "ativa505"
-            );
-
-
-            listaHistorico.style.display =
-                "none";
-
-
-            consoleTempoReal.style.display =
-                "block";
-
-
-            atualizarPainel505();
-
-        };
-
-
-        painel.querySelector(
-            "#fecharPainel505"
-        ).onclick = () => {
-
-            painel.remove();
-
-
-            if (intervaloMatrix) {
-
-                clearInterval(
-                    intervaloMatrix
-                );
-
-
-                intervaloMatrix =
-                    null;
-
-            }
-
-        };
-
-
-        painel.querySelector(
-            "#limparHistorico505"
-        ).onclick = () => {
-
-            if (
-
-                confirm(
-                    "Deseja realmente limpar todo o histórico de encomendas?"
-                )
-
-            ) {
-
-                localStorage.removeItem(
-                    STORAGE_HISTORICO
-                );
-
-
-                registrarEvento(
-                    "HISTÓRICO",
-                    "Histórico apagado manualmente"
-                );
-
-
-                atualizarPainel505();
-
-            }
-
-        };
-
-
-        painel.querySelector(
-            "#limparConsole505"
-        ).onclick = () => {
-
-            logsSistema =
-                [];
-
-
-            registrarEvento(
-                "SISTEMA",
-                "Console limpo"
-            );
-
-
-            atualizarPainel505();
-
-        };
-
+    function atualizarPainel() {
+        const painel = document.querySelector("#painelConsultas505");
+        if (!painel) return;
+
+        const modo = modoFiltro();
+        const historico = obterHistorico();
+        const pausado = modo === "todos" || modo === "entregues";
+
+        painel.querySelector("#filtro505").textContent =
+            modo === "aguardando" ? "AGUARDANDO ENTREGA" : pausado ? "PAUSADO" : "FORA DA TELA";
+        painel.querySelector("#unidade505").textContent =
+            modo === "aguardando" && unidadeAtual ? unidadeAtual : "NENHUMA";
+        painel.querySelector("#etapa505").textContent = pausado
+            ? "PAUSADO"
+            : modo === "aguardando" && unidadeAtual
+                ? quantidadeAtual > 0 ? `${quantidadeAtual} RESTANTE(S)` : "SEM PENDÊNCIAS"
+                : "AGUARDANDO";
+        painel.querySelector("#registros505").textContent = String(historico.length);
+        painel.querySelector("#acao505").textContent = logsSistema[0]
+            ? `${logsSistema[0].tipo}: ${logsSistema[0].mensagem}`
+            : "SISTEMA INICIADO";
+
+        painel.querySelector("#lista505").innerHTML = historico.length
+            ? historico.map(item => `
+                <div class="registro505">
+                    <div class="codigo505">${escaparHTML(item.codigo || item.apartamento)}</div>
+                    <div class="data505">${escaparHTML(item.dataCompleta || "")}</div>
+                    <div class="motivo505">${escaparHTML(item.motivo || "Possível baixa não confirmada")}</div>
+                </div>`).join("")
+            : '<div class="vazio505">SEM REGISTROS</div>';
     }
 
+    function iniciarMatrix() {
+        const canvas = document.querySelector("#matrix505");
+        const painel = document.querySelector("#painelConsultas505");
+        if (!canvas || !painel) return;
 
-    // ==========================================================
-    // ATUALIZAR PAINEL
-    // ==========================================================
+        canvas.width = painel.offsetWidth;
+        canvas.height = painel.offsetHeight;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
 
-    function atualizarPainel505() {
+        const chars = "01ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%&@";
+        const tam = 14;
+        const gotas = Array(Math.floor(canvas.width / tam)).fill(0).map(() => Math.random() * 40);
 
-        const painel =
-            document.querySelector(
-                "#painelConsultas505"
-            );
-
-
-        if (!painel)
-            return;
-
-
-        const historico =
-            obterHistorico();
-
-
-        const codigoAtual =
-            painel.querySelector(
-                "#codigoAtual505"
-            );
-
-
-        const etapaBaixa =
-            painel.querySelector(
-                "#etapaBaixa505"
-            );
-
-
-        const quantidade =
-            painel.querySelector(
-                "#quantidadeRegistros505"
-            );
-
-
-        const ultimaAcao =
-            painel.querySelector(
-                "#ultimaAcao505"
-            );
-
-
-        if (codigoAtual) {
-
-            codigoAtual.textContent =
-                encomendaAtual ||
-                "NENHUMA";
-
-        }
-
-
-        if (etapaBaixa) {
-
-            if (baixaConfirmada) {
-
-                etapaBaixa.textContent =
-                    "FINALIZADA";
-
-            } else if (baixaIniciada) {
-
-                etapaBaixa.textContent =
-                    "AGUARDANDO SIM";
-
-            } else if (encomendaAtual) {
-
-                etapaBaixa.textContent =
-                    "CÓDIGO CAPTURADO";
-
-            } else {
-
-                etapaBaixa.textContent =
-                    "AGUARDANDO";
-
+        if (intervaloMatrix) clearInterval(intervaloMatrix);
+        intervaloMatrix = setInterval(() => {
+            if (!document.body.contains(canvas)) {
+                clearInterval(intervaloMatrix);
+                intervaloMatrix = null;
+                return;
             }
-
-        }
-
-
-        if (quantidade) {
-
-            quantidade.textContent =
-                String(
-                    historico.length
-                );
-
-        }
-
-
-        if (ultimaAcao) {
-
-            const ultimoLog =
-                logsSistema[0];
-
-
-            ultimaAcao.textContent =
-
-                ultimoLog
-
-                    ? (
-                        ultimoLog.destaque
-                        ||
-                        `${ultimoLog.tipo}: ${ultimoLog.mensagem}`
-                    )
-
-                    : "SEM AÇÕES";
-
-        }
-
-
-        // ======================================================
-        // LISTA DO HISTÓRICO
-        // ======================================================
-
-        const listaHistorico =
-            painel.querySelector(
-                "#listaHistorico505"
-            );
-
-
-        if (listaHistorico) {
-
-            if (!historico.length) {
-
-                listaHistorico.innerHTML = `
-
-                    <div class="vazioSistema505">
-
-                        SEM REGISTROS
-
-                    </div>
-
-                `;
-
-            } else {
-
-                listaHistorico.innerHTML =
-
-                    historico.map(item => `
-
-                        <div class="registroSistema505">
-
-
-                            <div class="codigoSistema505">
-
-                                ${escaparHTML(
-                                    item.codigo
-                                )}
-
-                            </div>
-
-
-                            <div class="dataSistema505">
-
-                                ${escaparHTML(
-
-                                    item.dataCompleta
-
-                                    ||
-
-                                    `${item.data || ""} - ${item.hora || ""}`
-
-                                )}
-
-                            </div>
-
-
-                            <div class="motivoSistema505">
-
-                                ${escaparHTML(
-
-                                    item.motivo
-
-                                    ||
-
-                                    "Possível baixa não confirmada"
-
-                                )}
-
-                            </div>
-
-
-                        </div>
-
-                    `).join("");
-
-            }
-
-        }
-
-
-        // ======================================================
-        // CONSOLE EM TEMPO REAL
-        // ======================================================
-
-        const consoleTempoReal =
-            painel.querySelector(
-                "#consoleTempoReal505"
-            );
-
-
-        if (consoleTempoReal) {
-
-            if (!logsSistema.length) {
-
-                consoleTempoReal.innerHTML = `
-
-                    <div class="vazioSistema505">
-
-                        SEM ATIVIDADES
-
-                    </div>
-
-                `;
-
-            } else {
-
-                consoleTempoReal.innerHTML =
-
-                    logsSistema.map(log => `
-
-                        <div class="eventoConsole505">
-
-
-                            <div class="eventoTopo505">
-
-
-                                <span class="eventoTipo505">
-
-                                    ${escaparHTML(
-                                        log.tipo
-                                    )}
-
-                                </span>
-
-
-                                <span class="eventoHora505">
-
-                                    ${escaparHTML(
-                                        log.hora
-                                    )}
-
-                                </span>
-
-
-                            </div>
-
-
-                            <div class="eventoMensagem505">
-
-
-                                ${escaparHTML(
-                                    log.mensagem
-                                )}
-
-
-                                ${
-                                    log.destaque
-
-                                        ? `
-
-                                            <span class="eventoDestaque505">
-
-                                                · ${escaparHTML(
-                                                    log.destaque
-                                                )}
-
-                                            </span>
-
-                                        `
-
-                                        : ""
-                                }
-
-
-                            </div>
-
-
-                        </div>
-
-                    `).join("");
-
-            }
-
-        }
-
+            ctx.fillStyle = "rgba(0,0,0,.12)";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = "#22c55e";
+            ctx.font = `${tam}px monospace`;
+            gotas.forEach((y, i) => {
+                ctx.fillText(chars[Math.floor(Math.random() * chars.length)], i * tam, y * tam);
+                if (y * tam > canvas.height && Math.random() > .975) gotas[i] = 0;
+                gotas[i]++;
+            });
+        }, 90);
     }
 
-
-    setInterval(() => {
-
-        atualizarPainel505();
-
-    }, 500);
-
-
-    // ==========================================================
-    // MATRIX
-    // ==========================================================
-
-    function matrixPainel505() {
-
-        const canvas =
-            document.querySelector(
-                "#matrixPainel505"
-            );
-
-
-        const painel =
-            document.querySelector(
-                "#painelConsultas505"
-            );
-
-
-        if (
-            !canvas ||
-            !painel
-        ) {
-
-            return;
-
-        }
-
-
-        canvas.width =
-            painel.offsetWidth;
-
-
-        canvas.height =
-            painel.offsetHeight;
-
-
-        const contexto =
-            canvas.getContext("2d");
-
-
-        if (!contexto)
-            return;
-
-
-        const caracteres =
-            "01ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%&@";
-
-
-        const tamanho =
-            14;
-
-
-        const colunas =
-            Math.floor(
-                canvas.width /
-                tamanho
-            );
-
-
-        const gotas =
-            [];
-
-
-        for (
-
-            let indice = 0;
-
-            indice < colunas;
-
-            indice++
-
-        ) {
-
-            gotas[indice] =
-                Math.random() * 40;
-
-        }
-
-
-        if (intervaloMatrix) {
-
-            clearInterval(
-                intervaloMatrix
-            );
-
-        }
-
-
-        intervaloMatrix =
-            setInterval(() => {
-
-                if (
-
-                    !document.body.contains(
-                        canvas
-                    )
-
-                ) {
-
-                    clearInterval(
-                        intervaloMatrix
-                    );
-
-
-                    intervaloMatrix =
-                        null;
-
-
-                    return;
-
-                }
-
-
-                contexto.fillStyle =
-                    "rgba(0,0,0,.12)";
-
-
-                contexto.fillRect(
-
-                    0,
-
-                    0,
-
-                    canvas.width,
-
-                    canvas.height
-
-                );
-
-
-                contexto.fillStyle =
-                    "#22c55e";
-
-
-                contexto.font =
-                    `${tamanho}px monospace`;
-
-
-                for (
-
-                    let indice = 0;
-
-                    indice < gotas.length;
-
-                    indice++
-
-                ) {
-
-                    const caractere =
-
-                        caracteres[
-
-                            Math.floor(
-
-                                Math.random() *
-
-                                caracteres.length
-
-                            )
-
-                        ];
-
-
-                    contexto.fillText(
-
-                        caractere,
-
-                        indice * tamanho,
-
-                        gotas[indice] *
-                        tamanho
-
-                    );
-
-
-                    if (
-
-                        gotas[indice] *
-                        tamanho >
-
-                        canvas.height
-
-                        &&
-
-                        Math.random() >
-                        .975
-
-                    ) {
-
-                        gotas[indice] =
-                            0;
-
-                    }
-
-
-                    gotas[indice]++;
-
-                }
-
-            }, 90);
-
-    }
-
-
-    // ==========================================================
-    // GARANTIR BOTÃO
-    // ==========================================================
-
-    const observadorBotao =
-        new MutationObserver(() => {
-
-            criarBotaoMonitor();
-
-        });
-
-
-    observadorBotao.observe(
-
-        document.documentElement,
-
-        {
-
-            childList:
-                true,
-
-            subtree:
-                true
-
-        }
-
-    );
-
-
-    setInterval(() => {
-
-        criarBotaoMonitor();
-
-    }, 1500);
-
-
-    // ==========================================================
-    // INICIAR SISTEMA
-    // ==========================================================
+    new MutationObserver(criarBotao).observe(document.documentElement, {
+        childList: true,
+        subtree: true
+    });
+
+    setInterval(criarBotao, 1500);
+    setInterval(sincronizar, INTERVALO);
+    setInterval(atualizarPainel, 500);
 
     function iniciar() {
-
-        adicionarEstiloPainel();
-
-
-        criarBotaoMonitor();
-
-
-        procurarEncomenda();
-
-
-        registrarEvento(
-
-            "SISTEMA",
-
-            "Monitor v505 iniciado",
-
-            "MONITORAMENTO ATIVO"
-
-        );
-
+        adicionarEstilo();
+        criarBotao();
+        sincronizar();
+        registrarEvento("SISTEMA", "Monitor v505.1 iniciado", "MONITORAMENTO ATIVO");
     }
 
-
-    if (
-
-        document.readyState ===
-        "loading"
-
-    ) {
-
-        document.addEventListener(
-
-            "DOMContentLoaded",
-
-            iniciar,
-
-            {
-
-                once:
-                    true
-
-            }
-
-        );
-
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", iniciar, { once: true });
     } else {
-
         iniciar();
-
     }
-
-
-    console.log(
-        "MONITOR DE ENCOMENDAS PREMIUM v505 ONLINE"
-    );
-
-
 })();
