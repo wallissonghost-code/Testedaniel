@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         E sério - Monitor de Encomendas Premium
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  Monitora somente Aguardando entrega, registra ao sair com X > 0 e remove do histórico quando X = 0.
 // @author       Daniel Alexandre
 // @match        https://app.econdos.com.br/*
@@ -162,7 +162,7 @@
     }
 
     function sincronizar() {
-        // Primeiro registra a saída usando o último estado válido.
+        // Se mudou de URL, registra usando o último estado válido.
         if (location.href !== ultimaURL) {
             salvarPendencia("Saiu da página de encomendas");
             ultimaURL = location.href;
@@ -172,8 +172,12 @@
 
         const modo = modoFiltro();
 
-        // Todos e Entregues são totalmente ignorados.
+        // Se saiu do filtro "Aguardando entrega", registra antes de limpar.
         if (modo !== "aguardando") {
+            if (!saidaProcessada && sessaoAtiva && quantidadeAtual > 0) {
+                salvarPendencia("Saiu da página de encomendas");
+            }
+
             limparSessao();
             return;
         }
@@ -183,7 +187,6 @@
         const unidade = lerUnidadeSelecionada();
 
         if (!unidade) {
-            // Campo apagado: registra antes de limpar.
             if (sessaoAtiva && quantidadeAtual > 0) {
                 salvarPendencia("Campo apagado antes de concluir a baixa");
             }
@@ -288,7 +291,7 @@
         painel.innerHTML = `
             <div class="conteudoESerio">
                 <div class="topoESerio">
-                    <div><div class="tituloESerio">MONITOR DE ENCOMENDAS</div><div class="subtituloESerio">E SÉRIO · V1.0</div></div>
+                    <div><div class="tituloESerio">MONITOR DE ENCOMENDAS</div><div class="subtituloESerio">E SÉRIO · V1.0.1</div></div>
                     <div class="ledESerio"></div>
                 </div>
                 <div class="statusESerio">
