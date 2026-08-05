@@ -1,41 +1,27 @@
 // ==UserScript==
 // @name         Monitor Premium - Teste aba Todos
 // @namespace    http://tampermonkey.net/
-// @version      1.1.1-test
-// @description  Usa X em Aguardando, linhas pendentes em Todos e registra antes de trocar de tela, fechar ou atualizar.
+// @version      1.2.0-test
+// @description  Usa X em Aguardando, linhas pendentes em Todos e sobe a pendência ao histórico antes de trocar de tela, fechar ou atualizar.
 // @author       Daniel Alexandre
 // @match        https://app.econdos.com.br/*
 // @run-at       document-idle
 // @grant        none
 // @require      https://raw.githubusercontent.com/wallissonghost-code/Testedaniel/main/Monitor-encomendas-simples-v1.user.js
-// @require      https://raw.githubusercontent.com/wallissonghost-code/Testedaniel/main/Painel%20Plus%20V1%20Modf/monitor-painel-plus-v1.user.js
 // ==/UserScript==
 
 (function () {
     "use strict";
 
     const STORAGE_HISTORICO = "monitor_encomendas_simples_historico";
-    const STORAGE_ESTADO = "monitor_todos_estado_confiavel_v111";
+    const STORAGE_ESTADO = "monitor_todos_estado_confiavel_v120";
     const INTERVALO = 300;
 
     let ultimaURL = location.href;
     let saidaProcessada = false;
-    let ignorarProximaVisibilidade = false;
+    let escritaInterna = false;
 
-    function obterSetItemNativo() {
-        try {
-            const iframe = document.createElement("iframe");
-            iframe.style.display = "none";
-            document.documentElement.appendChild(iframe);
-            const nativo = iframe.contentWindow.Storage.prototype.setItem;
-            iframe.remove();
-            return nativo;
-        } catch {
-            return Storage.prototype.setItem;
-        }
-    }
-
-    const setItemNativo = obterSetItemNativo();
+    const setItemOriginal = Storage.prototype.setItem;
 
     function normalizar(valor) {
         return String(valor || "")
@@ -75,6 +61,31 @@
         return "outro";
     }
 
+    /*
+     * Impede o script-base de gravar o X total de Todos/Entregues.
+     * As gravações confiáveis deste complemento usam escritaInterna.
+     */
+    Storage.prototype.setItem = function (chave, valor) {
+        if (
+            String(chave) === STORAGE_HISTORICO &&
+            !escritaInterna &&
+            modoFiltro() !== "aguardando"
+        ) {
+            return;
+        }
+
+        return setItemOriginal.call(this, chave, valor);
+    };
+
+    function salvarDireto(chave, valor) {
+        escritaInterna = true;
+        try {
+            setItemOriginal.call(localStorage, chave, valor);
+        } finally {
+            escritaInterna = false;
+        }
+    }
+
     function unidadeAtual() {
         const campo = [...document.querySelectorAll(
             'input[data-testid="residence-autocomplete-input-search"]'
@@ -94,9 +105,7 @@
         const tabela = tabelaAtual();
         if (!tabela) return null;
 
-        for (const elemento of tabela.querySelectorAll(
-            "footer small, footer span, small"
-        )) {
+        for (const elemento of tabela.querySelectorAll("footer small")) {
             if (elemento.offsetParent === null) continue;
 
             const match = normalizar(elemento.textContent).match(
@@ -151,19 +160,14 @@
     }
 
     function salvarEstado(estado) {
-        try {
-            setItemNativo.call(
-                localStorage,
-                STORAGE_ESTADO,
-                JSON.stringify({
-                    ...estado,
-                    urlOrigem: location.href,
-                    atualizadoEm: Date.now()
-                })
-            );
-        } catch {
-            // Nunca interfere no e-Condos.
-        }
+        salvarDireto(
+            STORAGE_ESTADO,
+            JSON.stringify({
+                ...estado,
+                urlOrigem: location.href,
+                atualizadoEm: Date.now()
+            })
+        );
     }
 
     function obterEstado() {
@@ -180,7 +184,7 @@
         }
     }
 
-    function invalidarEstado() {
+    function limparEstado() {
         salvarEstado({
             modo: "outro",
             unidade: "",
@@ -200,8 +204,7 @@
     }
 
     function gravarHistorico(lista) {
-        setItemNativo.call(
-            localStorage,
+        salvarDireto(
             STORAGE_HISTORICO,
             JSON.stringify(lista.slice(0, 500))
         );
@@ -223,8 +226,6 @@
             return false;
         }
 
-        saidaProcessada = true;
-
         const texto = quantidade === 1
             ? "1 Encomenda não dado baixa"
             : `${quantidade} Encomendas não dado baixa`;
@@ -241,6 +242,8 @@
         });
 
         gravarHistorico(historico);
+        saidaProcessada = true;
+        atualizarPainel();
         return true;
     }
 
@@ -255,6 +258,7 @@
         if (novo.length === historico.length) return false;
 
         gravarHistorico(novo);
+        atualizarPainel();
         return true;
     }
 
@@ -265,55 +269,27 @@
 
         if (fechar && abrir) {
             fechar.click();
-            setTimeout(() => abrir.click(), 40);
-        }
-    }
-
-    function mostrarStatus(unidade, quantidade, modo) {
-        const painel = document.querySelector("#painelConsultas505");
-        const caixa = painel?.querySelector(".statusBox505");
-        if (!caixa) return;
-
-        let linha = painel.querySelector("#testeTodos505");
-        if (!linha) {
-            linha = document.createElement("div");
-            linha.id = "testeTodos505";
-            linha.className = "statusLinha505";
-            linha.innerHTML =
-                '<span>LEITURA CONFIÁVEL</span>' +
-                '<span id="testeTodosValor505" class="statusValor505">-</span>';
-            caixa.appendChild(linha);
-        }
-
-        const valor = linha.querySelector("#testeTodosValor505");
-
-        if (!unidade) {
-            valor.textContent = "AGUARDANDO UNIDADE";
-        } else if (modo === "todos") {
-            valor.textContent = `${quantidade} AGUARDANDO EM TODOS`;
-        } else {
-            valor.textContent = `${quantidade} PELO X`;
+            setTimeout(() => abrir.click(), 60);
         }
     }
 
     function processarTrocaInternaDeTela() {
         if (location.href === ultimaURL) return false;
 
-        // ESSENCIAL: registra usando o estado da tela anterior antes de
-        // consultar qualquer campo, filtro ou tabela da nova tela.
+        /*
+         * Aqui a pendência sobe de verdade para o histórico antes de a
+         * tela de encomendas desaparecer. Depois disso ela permanece lá,
+         * mesmo que o programa seja fechado em Portaria, Visitantes etc.
+         */
         registrarPendenciaConfiavel("Trocou de tela dentro do e-Condos");
 
         ultimaURL = location.href;
-        invalidarEstado();
+        limparEstado();
         saidaProcessada = false;
-        ignorarProximaVisibilidade = true;
-
         return true;
     }
 
     function sincronizar() {
-        // A troca de rota precisa ser a primeira verificação do ciclo.
-        // Antes, a nova tela apagava/substituía o estado e a pendência sumia.
         if (processarTrocaInternaDeTela()) return;
 
         const modo = modoFiltro();
@@ -324,11 +300,10 @@
 
             if (x !== null) {
                 salvarEstado({ modo, unidade, quantidade: x });
-                mostrarStatus(unidade, x, modo);
                 saidaProcessada = false;
 
-                if (x === 0 && removerDoHistorico(unidade)) {
-                    atualizarPainel();
+                if (x === 0) {
+                    removerDoHistorico(unidade);
                 }
             }
             return;
@@ -338,29 +313,23 @@
             const quantidade = pendentesEmTodos(unidade).length;
 
             salvarEstado({ modo, unidade, quantidade });
-            mostrarStatus(unidade, quantidade, modo);
             saidaProcessada = false;
 
-            if (quantidade === 0 && removerDoHistorico(unidade)) {
-                atualizarPainel();
+            if (quantidade === 0) {
+                removerDoHistorico(unidade);
             }
             return;
         }
 
         if (modo === "entregues") {
-            invalidarEstado();
+            limparEstado();
         }
     }
 
     document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState !== "hidden") return;
-
-        if (ignorarProximaVisibilidade) {
-            ignorarProximaVisibilidade = false;
-            return;
+        if (document.visibilityState === "hidden") {
+            registrarPendenciaConfiavel("Aplicativo minimizado ou fechado");
         }
-
-        registrarPendenciaConfiavel("Aplicativo minimizado ou fechado");
     }, true);
 
     window.addEventListener("beforeunload", () => {
