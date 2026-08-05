@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         E sério - Monitor de Encomendas Premium
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1
-// @description  Monitora somente Aguardando entrega, registra ao sair com X > 0 e remove do histórico quando X = 0.
+// @version      1.1.0
+// @description  Monitora Aguardando entrega, pausa em Todos/Entregues e registra pendências ao sair, limpar, atualizar ou fechar.
 // @author       Daniel Alexandre
 // @match        https://app.econdos.com.br/*
 // @run-at       document-idle
@@ -22,7 +22,6 @@
     let ultimaURL = location.href;
     let saidaProcessada = false;
     let painelAberto = false;
-    let logs = [];
 
     function normalizar(valor) {
         return String(valor || "")
@@ -43,7 +42,9 @@
 
     function obterHistorico() {
         try {
-            const lista = JSON.parse(localStorage.getItem(STORAGE_HISTORICO) || "[]");
+            const lista = JSON.parse(
+                localStorage.getItem(STORAGE_HISTORICO) || "[]"
+            );
             return Array.isArray(lista) ? lista : [];
         } catch {
             return [];
@@ -51,18 +52,16 @@
     }
 
     function gravarHistorico(lista) {
-        localStorage.setItem(STORAGE_HISTORICO, JSON.stringify(lista.slice(0, 500)));
-    }
-
-    function registrarLog(tipo, mensagem) {
-        logs.unshift({ tipo, mensagem, hora: new Date().toLocaleTimeString("pt-BR") });
-        logs = logs.slice(0, 100);
-        atualizarPainel();
+        localStorage.setItem(
+            STORAGE_HISTORICO,
+            JSON.stringify(lista.slice(0, 500))
+        );
     }
 
     function modoFiltro() {
-        const botao = [...document.querySelectorAll('button[data-testid="delivery-status-filter-button"]')]
-            .find(el => el.offsetParent !== null);
+        const botao = [...document.querySelectorAll(
+            'button[data-testid="delivery-status-filter-button"]'
+        )].find(elemento => elemento.offsetParent !== null);
 
         if (!botao) return "outro";
 
@@ -74,15 +73,25 @@
             ""
         );
 
-        if (texto.includes("aguardando") && texto.includes("entrega")) return "aguardando";
-        if (texto.includes("todos") || texto === "todas") return "todos";
-        if (texto.includes("entregue")) return "entregues";
+        if (texto.includes("aguardando") && texto.includes("entrega")) {
+            return "aguardando";
+        }
+
+        if (texto.includes("todos") || texto === "todas") {
+            return "todos";
+        }
+
+        if (texto.includes("entregue")) {
+            return "entregues";
+        }
+
         return "outro";
     }
 
     function lerUnidadeSelecionada() {
-        const campo = [...document.querySelectorAll('input[data-testid="residence-autocomplete-input-search"]')]
-            .find(el => el.offsetParent !== null);
+        const campo = [...document.querySelectorAll(
+            'input[data-testid="residence-autocomplete-input-search"]'
+        )].find(elemento => elemento.offsetParent !== null);
 
         if (!campo) return "";
 
@@ -91,8 +100,9 @@
     }
 
     function lerX() {
-        const tabela = [...document.querySelectorAll('[data-testid="delivery-table"]')]
-            .find(el => el.offsetParent !== null);
+        const tabela = [...document.querySelectorAll(
+            '[data-testid="delivery-table"]'
+        )].find(elemento => elemento.offsetParent !== null);
 
         if (!tabela) return null;
 
@@ -113,22 +123,23 @@
         if (!unidade) return false;
 
         const historico = obterHistorico();
-        const novo = historico.filter(item => item.apartamento !== unidade);
+        const novo = historico.filter(
+            item => item.apartamento !== unidade
+        );
 
         if (novo.length === historico.length) return false;
 
         gravarHistorico(novo);
-        registrarLog("BAIXA", `${unidade} removido do histórico porque X chegou a 0`);
         atualizarPainel();
         return true;
     }
 
     function salvarPendencia(motivo) {
-        if (saidaProcessada) return;
-        if (!sessaoAtiva) return;
-        if (!filtroValido) return;
-        if (!unidadeAtual) return;
-        if (quantidadeAtual <= 0) return;
+        if (saidaProcessada) return false;
+        if (!sessaoAtiva) return false;
+        if (!filtroValido) return false;
+        if (!unidadeAtual) return false;
+        if (quantidadeAtual <= 0) return false;
 
         saidaProcessada = true;
 
@@ -136,8 +147,9 @@
             ? "1 Encomenda não dado baixa"
             : `${quantidadeAtual} Encomendas não dado baixa`;
 
-        const historico = obterHistorico()
-            .filter(item => item.apartamento !== unidadeAtual);
+        const historico = obterHistorico().filter(
+            item => item.apartamento !== unidadeAtual
+        );
 
         historico.unshift({
             apartamento: unidadeAtual,
@@ -148,8 +160,8 @@
         });
 
         gravarHistorico(historico);
-        registrarLog("HISTÓRICO", `${unidadeAtual}: ${texto}`);
         atualizarPainel();
+        return true;
     }
 
     function limparSessao() {
@@ -162,7 +174,7 @@
     }
 
     function sincronizar() {
-        // Se mudou de URL, registra usando o último estado válido.
+        // Mudança real de rota: registra o último estado confiável antes de limpar.
         if (location.href !== ultimaURL) {
             salvarPendencia("Saiu da página de encomendas");
             ultimaURL = location.href;
@@ -172,12 +184,15 @@
 
         const modo = modoFiltro();
 
-        // Se saiu do filtro "Aguardando entrega", registra antes de limpar.
-        if (modo !== "aguardando") {
-            if (!saidaProcessada && sessaoAtiva && quantidadeAtual > 0) {
-                salvarPendencia("Saiu da página de encomendas");
-            }
+        // Todos e Entregues apenas pausam. Não leem X, não salvam e não limpam.
+        if (modo === "todos" || modo === "entregues") {
+            atualizarPainel();
+            return;
+        }
 
+        // O filtro não existe: a tela de encomendas foi desmontada ou abandonada.
+        if (modo === "outro") {
+            salvarPendencia("Saiu da página de encomendas");
             limparSessao();
             return;
         }
@@ -216,7 +231,10 @@
         const botao = evento.target.closest("button");
         if (!botao) return;
 
-        if (botao.getAttribute("data-testid") === "residence-autocomplete-clear-input-button") {
+        if (
+            botao.getAttribute("data-testid") ===
+            "residence-autocomplete-clear-input-button"
+        ) {
             salvarPendencia("Campo apagado antes de concluir a baixa");
             limparSessao();
         }
@@ -233,9 +251,9 @@
     function adicionarEstilo() {
         if (document.querySelector("#cssESerio")) return;
 
-        const style = document.createElement("style");
-        style.id = "cssESerio";
-        style.textContent = `
+        const estilo = document.createElement("style");
+        estilo.id = "cssESerio";
+        estilo.textContent = `
             #painelESerio,#painelESerio *{box-sizing:border-box;font-family:Arial,Helvetica,sans-serif}
             #painelESerio{position:fixed;top:60px;right:25px;width:410px;height:590px;background:#050505;color:#fff;z-index:2147483646;border-radius:18px;overflow:hidden;border:1px solid #22c55e;box-shadow:0 0 35px rgba(34,197,94,.35)}
             .conteudoESerio{padding:18px;height:100%;display:flex;flex-direction:column}
@@ -256,14 +274,16 @@
             #botaoESerio{display:inline-flex!important;align-items:center;justify-content:center;gap:8px;white-space:nowrap;margin-left:10px!important}
             @media(max-width:600px){#painelESerio{top:10px;left:10px;right:10px;width:auto;height:calc(100vh - 20px)}}
         `;
-        document.head.appendChild(style);
+        document.head.appendChild(estilo);
     }
 
     function criarBotao() {
         adicionarEstilo();
         if (document.querySelector("#botaoESerio")) return;
 
-        const referencia = document.querySelector('button[data-testid="delivery-select-multiple-deliveries-button"]');
+        const referencia = document.querySelector(
+            'button[data-testid="delivery-select-multiple-deliveries-button"]'
+        );
         if (!referencia) return;
 
         const botao = document.createElement("button");
@@ -291,7 +311,10 @@
         painel.innerHTML = `
             <div class="conteudoESerio">
                 <div class="topoESerio">
-                    <div><div class="tituloESerio">MONITOR DE ENCOMENDAS</div><div class="subtituloESerio">E SÉRIO · V1.0.1</div></div>
+                    <div>
+                        <div class="tituloESerio">MONITOR DE ENCOMENDAS</div>
+                        <div class="subtituloESerio">E SÉRIO · V1.1</div>
+                    </div>
                     <div class="ledESerio"></div>
                 </div>
                 <div class="statusESerio">
@@ -300,7 +323,10 @@
                     <div class="linhaESerio"><span>ETAPA</span><span id="quantidadeESerio" class="valorESerio">AGUARDANDO</span></div>
                     <div class="linhaESerio"><span>REGISTROS</span><span id="registrosESerio" class="valorESerio">0</span></div>
                 </div>
-                <div class="acoesESerio"><button id="limparESerio">LIMPAR HISTÓRICO</button><button id="fecharESerio">FECHAR</button></div>
+                <div class="acoesESerio">
+                    <button id="limparESerio">LIMPAR HISTÓRICO</button>
+                    <button id="fecharESerio">FECHAR</button>
+                </div>
                 <div id="listaESerio" class="listaESerio"></div>
                 <div class="rodapeESerio">Criado por Daniel Alexandre</div>
             </div>`;
@@ -328,12 +354,23 @@
         const modo = modoFiltro();
         const historico = obterHistorico();
 
-        painel.querySelector("#filtroESerio").textContent = modo === "aguardando" ? "AGUARDANDO ENTREGA" : "IGNORADO";
-        painel.querySelector("#unidadeESerio").textContent = modo === "aguardando" && unidadeAtual ? unidadeAtual : "NENHUMA";
-        painel.querySelector("#quantidadeESerio").textContent = modo === "aguardando" && unidadeAtual
-            ? (quantidadeAtual > 0 ? `${quantidadeAtual} RESTANTE(S)` : "SEM PENDÊNCIAS")
-            : "AGUARDANDO";
-        painel.querySelector("#registrosESerio").textContent = String(historico.length);
+        const filtroTexto = modo === "aguardando"
+            ? "AGUARDANDO ENTREGA"
+            : (modo === "todos" || modo === "entregues")
+                ? "PAUSADO"
+                : "FORA DA TELA";
+
+        painel.querySelector("#filtroESerio").textContent = filtroTexto;
+        painel.querySelector("#unidadeESerio").textContent =
+            modo === "aguardando" && unidadeAtual ? unidadeAtual : "NENHUMA";
+        painel.querySelector("#quantidadeESerio").textContent =
+            modo === "aguardando" && unidadeAtual
+                ? (quantidadeAtual > 0
+                    ? `${quantidadeAtual} RESTANTE(S)`
+                    : "SEM PENDÊNCIAS")
+                : "AGUARDANDO";
+        painel.querySelector("#registrosESerio").textContent =
+            String(historico.length);
 
         const lista = painel.querySelector("#listaESerio");
         lista.innerHTML = historico.length
@@ -346,7 +383,10 @@
             : '<div class="vazioESerio">SEM REGISTROS</div>';
     }
 
-    new MutationObserver(criarBotao).observe(document.documentElement, { childList: true, subtree: true });
+    new MutationObserver(criarBotao).observe(
+        document.documentElement,
+        { childList: true, subtree: true }
+    );
 
     criarBotao();
     sincronizar();
