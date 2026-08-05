@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Monitor Premium - Teste aba Todos
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0-test
-// @description  Teste separado: usa X em Aguardando, linhas pendentes em Todos e preserva saída ao fechar, atualizar ou trocar de tela.
+// @version      1.1.1-test
+// @description  Usa X em Aguardando, linhas pendentes em Todos e registra antes de trocar de tela, fechar ou atualizar.
 // @author       Daniel Alexandre
 // @match        https://app.econdos.com.br/*
 // @run-at       document-idle
@@ -15,14 +15,13 @@
     "use strict";
 
     const STORAGE_HISTORICO = "monitor_encomendas_simples_historico";
-    const STORAGE_ESTADO = "monitor_todos_estado_confiavel_v110";
-    const INTERVALO = 500;
+    const STORAGE_ESTADO = "monitor_todos_estado_confiavel_v111";
+    const INTERVALO = 300;
 
     let ultimaURL = location.href;
     let saidaProcessada = false;
+    let ignorarProximaVisibilidade = false;
 
-    // Obtém uma referência limpa ao setItem nativo para salvar durante
-    // pagehide, mesmo quando o DOM do filtro já estiver desaparecendo.
     function obterSetItemNativo() {
         try {
             const iframe = document.createElement("iframe");
@@ -95,15 +94,12 @@
         const tabela = tabelaAtual();
         if (!tabela) return null;
 
-        const elementos = tabela.querySelectorAll(
+        for (const elemento of tabela.querySelectorAll(
             "footer small, footer span, small"
-        );
-
-        for (const elemento of elementos) {
+        )) {
             if (elemento.offsetParent === null) continue;
 
-            const texto = normalizar(elemento.textContent);
-            const match = texto.match(
+            const match = normalizar(elemento.textContent).match(
                 /(?:^|\s)(\d+)\s+encomenda(?:\(s\)|s)?(?:\s|$)/
             );
 
@@ -117,15 +113,11 @@
         const tabela = tabelaAtual();
         if (!tabela) return [];
 
-        const seletores = [
-            "tbody tr",
-            "[role='row']",
-            ".ag-row"
+        const linhas = [
+            ...tabela.querySelectorAll("tbody tr"),
+            ...tabela.querySelectorAll("[role='row']"),
+            ...tabela.querySelectorAll(".ag-row")
         ];
-
-        const linhas = seletores.flatMap(seletor =>
-            [...tabela.querySelectorAll(seletor)]
-        );
 
         return [...new Set(linhas)]
             .filter(el => el.offsetParent !== null);
@@ -149,9 +141,8 @@
                 normal.includes("aguardando entrega") ||
                 normal.includes("aguardando a entrega");
 
-            if (!aguardando) continue;
+            if (!aguardando || vistos.has(normal)) continue;
 
-            if (vistos.has(normal)) continue;
             vistos.add(normal);
             resultado.push(texto);
         }
@@ -166,11 +157,12 @@
                 STORAGE_ESTADO,
                 JSON.stringify({
                     ...estado,
+                    urlOrigem: location.href,
                     atualizadoEm: Date.now()
                 })
             );
         } catch {
-            // Falha silenciosa para não interferir no e-Condos.
+            // Nunca interfere no e-Condos.
         }
     }
 
@@ -188,7 +180,7 @@
         }
     }
 
-    function limparEstado() {
+    function invalidarEstado() {
         salvarEstado({
             modo: "outro",
             unidade: "",
@@ -216,27 +208,27 @@
     }
 
     function registrarPendenciaConfiavel(motivo) {
-        if (saidaProcessada) return;
+        if (saidaProcessada) return false;
 
         const estado = obterEstado();
-        if (!estado) return;
+        if (!estado) return false;
+
+        const quantidade = Number(estado.quantidade);
 
         if (
             !["aguardando", "todos"].includes(estado.modo) ||
             !estado.unidade ||
-            Number(estado.quantidade) <= 0
+            quantidade <= 0
         ) {
-            return;
+            return false;
         }
 
         saidaProcessada = true;
 
-        const quantidade = Number(estado.quantidade);
         const texto = quantidade === 1
             ? "1 Encomenda não dado baixa"
             : `${quantidade} Encomendas não dado baixa`;
 
-        // Um cartão por unidade: atualiza a ocorrência em vez de duplicar.
         const historico = obterHistorico()
             .filter(item => item.apartamento !== estado.unidade);
 
@@ -249,6 +241,7 @@
         });
 
         gravarHistorico(historico);
+        return true;
     }
 
     function removerDoHistorico(unidade) {
@@ -303,7 +296,26 @@
         }
     }
 
+    function processarTrocaInternaDeTela() {
+        if (location.href === ultimaURL) return false;
+
+        // ESSENCIAL: registra usando o estado da tela anterior antes de
+        // consultar qualquer campo, filtro ou tabela da nova tela.
+        registrarPendenciaConfiavel("Trocou de tela dentro do e-Condos");
+
+        ultimaURL = location.href;
+        invalidarEstado();
+        saidaProcessada = false;
+        ignorarProximaVisibilidade = true;
+
+        return true;
+    }
+
     function sincronizar() {
+        // A troca de rota precisa ser a primeira verificação do ciclo.
+        // Antes, a nova tela apagava/substituía o estado e a pendência sumia.
+        if (processarTrocaInternaDeTela()) return;
+
         const modo = modoFiltro();
         const unidade = unidadeAtual();
 
@@ -311,11 +323,7 @@
             const x = lerX();
 
             if (x !== null) {
-                salvarEstado({
-                    modo,
-                    unidade,
-                    quantidade: x
-                });
+                salvarEstado({ modo, unidade, quantidade: x });
                 mostrarStatus(unidade, x, modo);
                 saidaProcessada = false;
 
@@ -323,37 +331,36 @@
                     atualizarPainel();
                 }
             }
-        } else if (modo === "todos" && unidade) {
-            const pendentes = pendentesEmTodos(unidade);
-            const quantidade = pendentes.length;
+            return;
+        }
 
-            salvarEstado({
-                modo,
-                unidade,
-                quantidade
-            });
+        if (modo === "todos" && unidade) {
+            const quantidade = pendentesEmTodos(unidade).length;
+
+            salvarEstado({ modo, unidade, quantidade });
             mostrarStatus(unidade, quantidade, modo);
             saidaProcessada = false;
 
             if (quantidade === 0 && removerDoHistorico(unidade)) {
                 atualizarPainel();
             }
-        } else if (modo === "entregues") {
-            // Entregues nunca cria nem apaga ocorrência.
-            limparEstado();
+            return;
         }
 
-        if (location.href !== ultimaURL) {
-            registrarPendenciaConfiavel("Saiu da tela de encomendas");
-            ultimaURL = location.href;
+        if (modo === "entregues") {
+            invalidarEstado();
         }
     }
 
-    // visibilitychange costuma ocorrer antes de o aplicativo/aba desaparecer.
     document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "hidden") {
-            registrarPendenciaConfiavel("Aplicativo minimizado ou fechado");
+        if (document.visibilityState !== "hidden") return;
+
+        if (ignorarProximaVisibilidade) {
+            ignorarProximaVisibilidade = false;
+            return;
         }
+
+        registrarPendenciaConfiavel("Aplicativo minimizado ou fechado");
     }, true);
 
     window.addEventListener("beforeunload", () => {
